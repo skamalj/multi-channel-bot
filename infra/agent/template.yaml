@@ -12,6 +12,20 @@ Parameters:
   ContainerUri:
     Type: String
     Description: ECR image URI including the tag, pushed by the deploy workflow.
+  GuardrailId:
+    Type: String
+    Default: ''
+    Description: From mcb-guardrails. Empty runs the agent with no guardrail.
+  GuardrailVersion:
+    Type: String
+    Default: DRAFT
+  KnowledgeBaseId:
+    Type: String
+    Default: ''
+    Description: From mcb-knowledge. Empty falls back to the local corpus.
+  GatewayUrl:
+    Type: String
+    Default: ''
   ModelId:
     Type: String
     Default: moonshotai.kimi-k2.5
@@ -86,8 +100,19 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
               - Sid: Retrieve
                 Effect: Allow
-                Action: bedrock:Retrieve
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
                 Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+              # Two calls, two purposes. InvokeModel carries the guardrail
+              # inline on the Converse request; ApplyGuardrail is the separate
+              # call for text the model never generated - retrieved passages,
+              # tool results, an inbound WhatsApp message.
+              - Sid: Guardrail
+                Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
               # The two checkpointers and the two long-term stores. Named, not
               # wildcarded: this role has no business in any other table.
               - Sid: Checkpoints
@@ -162,6 +187,10 @@ Resources:
         DDB_PROFILE_TABLE: !Sub "${Prefix}-profiles"
         DDB_AUDIT_TABLE: !Sub "${Prefix}-audit"
         S3_BUCKET: !Sub "${Prefix}-documents-${AWS::AccountId}"
+        GUARDRAIL_ID: !Ref GuardrailId
+        GUARDRAIL_VERSION: !Ref GuardrailVersion
+        KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+        GATEWAY_URL: !Ref GatewayUrl
         SSM_PREFIX: !Sub "/${Prefix}"
       Tags:
         Project: !Ref Prefix

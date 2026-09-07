@@ -39,6 +39,25 @@ class Settings(BaseSettings):
     # the answers it produced.
     prompt_version: str = "v0.3"
 
+    # Bedrock Guardrails (deployed by infra/guardrails). Empty means no
+    # guardrail is attached, which is the offline and test posture - the
+    # deploy asserts it is set in a real environment rather than letting a
+    # missing id silently disable the control.
+    guardrail_id: str = ""
+    guardrail_version: str = "DRAFT"
+
+    # Bedrock Knowledge Base. Empty falls back to the local corpus, which is
+    # what the offline tests use.
+    knowledge_base_id: str = ""
+
+    # Redshift. Empty means the in-memory core store (NF-2 / offline tests).
+    redshift_host: str = ""
+    redshift_port: int = 5439
+    redshift_db: str = "mcb"
+    redshift_user: str = "mcbadmin"
+    redshift_password: str = ""
+    redshift_schema: str = "mcb"
+
     # Retrieval (KB-3/KB-5). Below the floor the bot refuses and offers a human.
     retrieval_k: int = 4
     retrieval_candidates: int = 12

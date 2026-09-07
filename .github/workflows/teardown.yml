@@ -109,7 +109,7 @@ jobs:
       # error - teardown has to be re-runnable after a partial failure.
       - name: delete stacks
         run: |
-          for s in agent tools knowledge data foundation; do
+          for s in agent tools guardrails knowledge data foundation; do
             name="${PREFIX}-${s}"
             if aws cloudformation describe-stacks --stack-name "$name" >/dev/null 2>&1; then
               echo "::group::deleting $name"
@@ -143,7 +143,7 @@ jobs:
           report() { echo "  SURVIVING $1"; found=1; }
 
           # Stacks are the authoritative answer for everything inside them.
-          for s in foundation data knowledge tools agent; do
+          for s in foundation data knowledge guardrails tools agent; do
             if aws cloudformation describe-stacks --stack-name ${PREFIX}-${s} >/dev/null 2>&1; then
               report "stack ${PREFIX}-${s}"
             fi

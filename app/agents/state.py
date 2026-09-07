@@ -63,4 +63,7 @@ class BotState(TypedDict, total=False):
     looked_up: bool
     parked: bool
     last_tools: list[str]
+    # Set by the entry node when Bedrock Guardrails rejected the inbound
+    # message. Per-turn scratch like the rest of this block.
+    inbound_blocked: bool
     last_citations: list[str]

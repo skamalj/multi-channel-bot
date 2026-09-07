@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcb-guardrails - Bedrock Guardrails for the Protec bot. Deployed and torn
+  down with everything else, because a safety control that only exists on
+  somebody's laptop is not a control.
+
+# WHAT THIS DOES AND DOES NOT REPLACE
+#
+# Bedrock Guardrails and our own citation guardrail answer different
+# questions, and keeping both is deliberate:
+#
+#   Bedrock contextual grounding asks "is this response supported by the
+#   source material, probabilistically?" and scores it.
+#
+#   app/agents/citations.py asks "does every material claim carry a citation
+#   id that RESOLVES to a document we actually retrieved?" and rewrites the
+#   answer if not.
+#
+# The second is a rule, not a score. A fabricated premium that happens to read
+# as well-grounded passes a threshold; it does not pass "name the document".
+# Conversely, grounding catches drift in prose that carries no figure at all,
+# which the citation rule was never designed to see. Neither is a superset.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  GroundingThreshold:
+    Type: Number
+    Default: 0.75
+    Description: >
+      Below this, the response is not considered supported by the retrieved
+      passages. Set deliberately high: this is insurance, and the cost of a
+      confident wrong answer about cover is not symmetric with the cost of a
+      refusal.
+  RelevanceThreshold:
+    Type: Number
+    Default: 0.5
+    Description: How related the response must be to what was actually asked.
+  PolicyRevision:
+    Type: String
+    Default: manual
+    Description: >-
+      A hash of this template, supplied by the deploy workflow. It exists to
+      force a NEW guardrail version whenever the policy changes - see the
+      comment on GuardrailVersion. Never set this by hand outside a test.
+
+Resources:
+
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${Prefix}-protec"
+      Description: Content, topic, PII and grounding controls for the Protec bot.
+
+      # The customer never sees the machinery. These read as something a
+      # person would say, and both offer the way out that the rest of the
+      # system offers - a colleague who can check properly.
+      BlockedInputMessaging: >-
+        I am not able to help with that here. If it is about your policy or a
+        claim, I can put you through to a colleague who can.
+      BlockedOutputsMessaging: >-
+        I could not give you a reliable answer to that, so I would rather not
+        guess. Shall I put you through to a colleague who can check it
+        properly?
+
+      ContentPolicyConfig:
+        FiltersConfig:
+          # PROMPT_ATTACK is input-only by definition - AWS rejects an output
+          # strength on it.
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: INSULTS
+            InputStrength: MEDIUM
+            OutputStrength: HIGH
+          - Type: SEXUAL
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: VIOLENCE
+            InputStrength: MEDIUM
+            OutputStrength: HIGH
+          # Misconduct covers "how do I get a claim paid for damage I caused
+          # deliberately" - a real question an insurance bot is asked.
+          - Type: MISCONDUCT
+            InputStrength: HIGH
+            OutputStrength: HIGH
+
+      TopicPolicyConfig:
+        TopicsConfig:
+          # Regulated advice. The bot may explain what a product covers; it
+          # may not tell someone what to buy or what their diagnosis means.
+          - Name: PersonalisedInvestmentAdvice
+            Type: DENY
+            Definition: >-
+              Recommending specific investments, comparing insurance to
+              investment products as a savings vehicle, projecting returns, or
+              telling a customer what financial decision to make for their
+              circumstances.
+            Examples:
+              - Should I buy ULIP or put the money in a mutual fund?
+              - Is this policy a good investment for my retirement?
+              - What return will I get if I pay premiums for ten years?
+          - Name: MedicalAdvice
+            Type: DENY
+            # Topic definitions are capped at 200 characters. The first
+            # attempt at this one was ~330 and the stack update was rejected,
+            # so it says the same thing tersely.
+            Definition: >-
+              Any clinical judgement about a person's health: naming a
+              condition, interpreting symptoms, lab values, scans or reports,
+              recommending treatment or medication, or advising whether to
+              seek care.
+            Examples:
+              # Probed against the deployed guardrail: the first two were
+              # caught by the original definition and the third was not, so
+              # the definition now names lab values and reports explicitly.
+              - I have chest pain and shortness of breath, should I see a doctor?
+              - Should I delay my surgery until the waiting period ends?
+              - My reports show high creatinine, what disease do I have?
+              - My blood test shows a high value, what does that mean?
+              - Should I stop taking this medication before the health check?
+          - Name: LegalAdvice
+            Type: DENY
+            Definition: >-
+              Advising on legal strategy, the merits of litigation, or how to
+              present a case against an insurer or another party.
+            Examples:
+              - Can I sue you if the claim is rejected?
+              - What should I say to the police about the accident?
+          - Name: CompetitorDisparagement
+            Type: DENY
+            Definition: >-
+              Comparing Protec products to a named competitor, or commenting
+              on another insurer's financial health, service or claims record.
+            Examples:
+              - Is your policy better than the one from the other insurer?
+              - Do they reject more claims than you do?
+
+      # PII is where an insurance bot needs care. It legitimately handles the
+      # customer's own name, phone number and policy references - masking
+      # those would break the product. What is masked is what the bot has no
+      # business repeating back.
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - Type: CREDIT_DEBIT_CARD_NUMBER
+            Action: BLOCK
+          - Type: CREDIT_DEBIT_CARD_CVV
+            Action: BLOCK
+          - Type: CREDIT_DEBIT_CARD_EXPIRY
+            Action: BLOCK
+          - Type: PIN
+            Action: BLOCK
+          - Type: PASSWORD
+            Action: BLOCK
+          - Type: AWS_ACCESS_KEY
+            Action: BLOCK
+          - Type: AWS_SECRET_KEY
+            Action: BLOCK
+          # Anonymised rather than blocked: a customer may well type their own
+          # email or address, and refusing the turn would be worse service
+          # than continuing without echoing it.
+          - Type: EMAIL
+            Action: ANONYMIZE
+          - Type: INTERNATIONAL_BANK_ACCOUNT_NUMBER
+            Action: ANONYMIZE
+        RegexesConfig:
+          # India-specific identifiers the standard entity list does not cover.
+          - Name: PAN
+            Description: Indian Permanent Account Number
+            Pattern: '[A-Z]{5}[0-9]{4}[A-Z]'
+            Action: ANONYMIZE
+          - Name: Aadhaar
+            Description: Indian national identity number
+            Pattern: '\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b'
+            Action: BLOCK
+
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - Type: PROFANITY
+
+      # The hallucination control. Requires a grounding source at invoke time,
+      # which is why it is applied where the retrieved passages are known -
+      # see app/agents/guardrail.py.
+      ContextualGroundingPolicyConfig:
+        FiltersConfig:
+          - Type: GROUNDING
+            Threshold: !Ref GroundingThreshold
+          - Type: RELEVANCE
+            Threshold: !Ref RelevanceThreshold
+
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # A guardrail is always DRAFT until versioned, and the agent points at a
+  # fixed version so that editing the guardrail cannot silently change the
+  # behaviour of a running deployment.
+  #
+  # THE TRAP: a version is an immutable snapshot, and updating the guardrail
+  # does NOT produce a new one. Found the hard way - after tightening a topic
+  # definition, DRAFT had the new policy and version 1 still had the old one,
+  # so the change deployed cleanly and did nothing. The agent would have gone
+  # on running the policy we thought we had replaced.
+  #
+  # PolicyRevision is a hash of this file, so any policy change alters the
+  # Description, CloudFormation replaces this resource, and a new version is
+  # cut automatically.
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: !Sub "Deployed version. Policy revision ${PolicyRevision}."
+
+
+Outputs:
+  GuardrailId:
+    Value: !GetAtt Guardrail.GuardrailId
+    Export: { Name: !Sub "${Prefix}-guardrail-id" }
+  GuardrailArn:
+    Value: !GetAtt Guardrail.GuardrailArn
+    Export: { Name: !Sub "${Prefix}-guardrail-arn" }
+  GuardrailVersion:
+    Value: !GetAtt GuardrailVersion.Version
+    Export: { Name: !Sub "${Prefix}-guardrail-version" }

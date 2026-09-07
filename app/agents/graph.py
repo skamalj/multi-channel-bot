@@ -32,7 +32,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import citations, confirm, reduce as reducer
+from app.agents import citations, confirm, guardrail, reduce as reducer
 from app.agents.state import BotState
 from app.config import settings
 from app.llm.bedrock import get_llm
@@ -118,10 +118,27 @@ class Agent:
 
     # -- nodes ------------------------------------------------------------
     def _entry(self, state: BotState, config) -> dict:
-        """Clear the per-turn scratch. Journey state is untouched."""
+        """Clear the per-turn scratch, and screen what arrived.
+
+        Journey state is untouched. The inbound screen is the ApplyGuardrail
+        call over text the model has not seen yet - a channel is an untrusted
+        boundary, and WhatsApp in particular carries text from anyone who
+        knows the number.
+        """
+        _, trace = _turn(config)
+        blocked = False
+        if guardrail.configured():
+            text = _last_human_text(state) or ""
+            if text:
+                v = guardrail.screen_inbound(text)
+                if v.action not in ("NOT_CONFIGURED",):
+                    trace.add("guardrail", "inbound", action=v.action,
+                              reasons=v.reasons, blocked=v.blocked)
+                blocked = v.blocked
         return {"rounds": 0, "retrieved": [], "tool_facts": [],
                 "tools_called": [], "used_core_tool": False,
-                "looked_up": False, "parked": False, "last_citations": []}
+                "looked_up": False, "parked": False, "last_citations": [],
+                "inbound_blocked": blocked}
 
     def _reduce(self, state: BotState, config) -> dict:
         """Bound the thread before anything reads it.
@@ -296,6 +313,30 @@ class Agent:
                   grounded_by=("retrieval" if retrieved
                                else "core tool" if state.get("used_core_tool")
                                else "nothing"))
+        # Contextual grounding, against the passages the answer was supposed
+        # to come from. This is deliberately AFTER citations.enforce: the two
+        # ask different questions, and a rewritten refusal should be checked
+        # in the form the customer will actually see.
+        if guardrail.configured() and text and not report.get("refused"):
+            passages = [str(r.get("text") or r.get("chunk") or "")
+                        for r in retrieved]
+            if passages:
+                v = guardrail.screen_retrieved(
+                    passages, _last_human_text(state) or "", text)
+                if v.action not in ("NOT_CONFIGURED", "ERROR"):
+                    trace.add("guardrail", "grounding", action=v.action,
+                              grounding=v.grounding, relevance=v.relevance,
+                              reasons=v.reasons, blocked=v.blocked)
+                if v.blocked:
+                    # Ungrounded prose reaching a customer is the failure this
+                    # exists to prevent, so it becomes the same refusal the
+                    # citation guardrail would produce - not an error.
+                    text = citations.REFUSAL
+                    report["refused"] = True
+                elif v.text and v.text != text:
+                    # PII the guardrail masked. Take its version.
+                    text = v.text
+
         trace.add("respond", "final", chars=len(text or ""), tools=tools_called)
 
         # Same id replaces the model's message in place, so the transcript

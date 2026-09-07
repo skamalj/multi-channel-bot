@@ -141,12 +141,23 @@ def get_llm(small: bool = False):
         return StubLLM()
     from langchain_aws import ChatBedrockConverse
 
-    return ChatBedrockConverse(
+    from app.agents.guardrail import model_config
+
+    kwargs: dict[str, Any] = dict(
         model=cfg.bedrock_small_model_id if small else cfg.bedrock_model_id,
         region_name=cfg.aws_region,
         temperature=cfg.llm_temperature,
         max_tokens=cfg.llm_max_tokens,
     )
+    # The guardrail rides on the Converse call itself. When it intervenes the
+    # response carries stopReason == "guardrail_intervened" rather than
+    # raising, so callers check `guardrail.intervened(resp)` - see the respond
+    # node. None here means no guardrail is deployed, which is the offline
+    # posture, not a silent opt-out.
+    gc = model_config()
+    if gc:
+        kwargs["guardrail_config"] = gc
+    return ChatBedrockConverse(**kwargs)
 
 
 def _json_from(text: str) -> dict:
