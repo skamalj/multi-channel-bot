@@ -20,6 +20,16 @@ Parameters:
     Type: String
     Default: main
     Description: The only branch permitted to assume the deploy role.
+  GitHubOwnerId:
+    Type: String
+    Default: '32254183'
+    Description: >
+      Numeric owner id. GitHub emits ID-qualified subjects
+      (owner@id/repo@id), not the plain owner/repo form the docs show.
+  GitHubRepoId:
+    Type: String
+    Default: '1360189167'
+    Description: Numeric repository id, for the same reason.
 
 Resources:
 
@@ -130,6 +140,27 @@ Resources:
                   - iam:ListAttachedRolePolicies
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-*"
+              # SAM templates carry `Transform: AWS::Serverless-2016-10-31`,
+              # and CloudFormation treats the transform as a RESOURCE that
+              # the executing role must be allowed to change-set against.
+              # Without this, every SAM stack fails at changeset creation
+              # while every plain CloudFormation stack succeeds - which is a
+              # confusing way to find out.
+              - Sid: SamTransform
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+              - Sid: StackIntrospection
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
               - Sid: ServiceLinkedRoles
                 Effect: Allow
                 Action: iam:CreateServiceLinkedRole
@@ -157,6 +188,14 @@ Resources:
                 # public.
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 token.actions.githubusercontent.com:sub:
+                  # The ID-qualified forms are what this account actually
+                  # emits, and they are STRICTER than the name-based ones:
+                  # delete and recreate the repository and the id changes,
+                  # so a squatter taking the freed name gains nothing.
+                  - !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${DeployBranch}"
+                  - !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:production"
+                  # Kept so the stack still works if the account reverts to
+                  # the plain form the documentation describes.
                   - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DeployBranch}"
                   - !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:production"
       Policies:
