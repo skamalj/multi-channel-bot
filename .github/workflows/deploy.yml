@@ -110,6 +110,19 @@ jobs:
       # laptop: `sam build` on Windows resolves Windows wheels for psycopg,
       # and the fix that normally applies (--use-container) needs Docker.
       # On a Linux runner the wheels are simply correct.
+      # A stack whose first CREATE failed sits in ROLLBACK_COMPLETE, and
+      # CloudFormation will not update it - it can only be deleted. Left
+      # alone, a single bad deploy blocks every deploy after it.
+      - name: clear a failed first create
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-data                  --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          echo "mcb-data is $st"
+          if [ "$st" = "ROLLBACK_COMPLETE" ]; then
+            echo "deleting the failed create so this deploy can proceed"
+            aws cloudformation delete-stack --stack-name ${PREFIX}-data               --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-data
+          fi
+
       - name: sam build
         run: sam build --template infra/data/template.yaml --build-dir .aws-sam/data
 

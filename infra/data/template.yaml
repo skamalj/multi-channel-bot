@@ -234,7 +234,9 @@ Resources:
       Environment:
         Variables:
           REDSHIFT_HOST: !GetAtt Workgroup.Workgroup.Endpoint.Address
-          REDSHIFT_PORT: !GetAtt Workgroup.Workgroup.Endpoint.Port
+          # !Sub, not !GetAtt: Endpoint.Port is an Integer and a Lambda
+          # environment value must be a String.
+          REDSHIFT_PORT: !Sub "${Workgroup.Workgroup.Endpoint.Port}"
           REDSHIFT_DB: !Ref DbName
           REDSHIFT_USER: !Ref AdminUsername
           # Resolved at deploy time. The Lambda cannot call SSM from this VPC
