@@ -125,19 +125,39 @@ jobs:
             fi
           done
 
-      # A verification, not a hope. Note the exclusions: mcb-bootstrap and its
-      # artifacts bucket are SUPPOSED to survive - they are what this workflow
-      # authenticated with. Without excluding them the check would fail on
-      # every successful teardown, which is an alarm nobody would keep.
+      # A verification, not a hope - but it has to be right about what
+      # "survives" means, in two ways.
+      #
+      # 1. Some things are SUPPOSED to survive: mcb-bootstrap and its
+      #    artifacts bucket (what this workflow authenticated with), and the
+      #    SSM parameter holding the Redshift password. That parameter is the
+      #    store of record - deleting it would make the NEXT deploy fail, so
+      #    it deliberately outlives the stacks, like bootstrap does.
+      #
+      # 2. The tagging API lags. It kept returning VPC endpoints and a
+      #    Cognito user pool that CloudFormation had already deleted, so a
+      #    single query fails a teardown that actually worked. Anything still
+      #    listed after several attempts is a real orphan; anything that
+      #    disappears was just the index catching up.
       - name: verify nothing of ours survives
         run: |
-          aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=${PREFIX}" --query 'ResourceTagMappingList[].ResourceARN' --output text | xargs -n1 | grep -v ":stack/${PREFIX}-bootstrap/" | grep -v ":::${PREFIX}-artifacts-" > /tmp/survivors.txt || true
-          if [ -s /tmp/survivors.txt ]; then
-            echo "these resources outlived teardown:"
+          survivors() {
+            aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=${PREFIX}" --query 'ResourceTagMappingList[].ResourceARN' --output text               | xargs -n1               | grep -v ":stack/${PREFIX}-bootstrap/"               | grep -v ":::${PREFIX}-artifacts-"               | grep -v ":parameter/${PREFIX}/"               || true
+          }
+          for attempt in 1 2 3 4 5; do
+            survivors > /tmp/survivors.txt
+            if [ ! -s /tmp/survivors.txt ]; then
+              echo "clean on attempt $attempt"
+              echo "only mcb-bootstrap, its artifacts bucket and the SSM parameters remain, by design"
+              exit 0
+            fi
+            echo "attempt $attempt still lists $(wc -l < /tmp/survivors.txt):"
             cat /tmp/survivors.txt
-            exit 1
-          fi
-          echo "clean: only mcb-bootstrap and its artifacts bucket remain, by design"
+            sleep 30
+          done
+          echo "these resources outlived teardown after five attempts:"
+          cat /tmp/survivors.txt
+          exit 1
 
       # The other half of the guard. Deleting something the project does not
       # own is a worse failure than leaving something behind, so this runs
