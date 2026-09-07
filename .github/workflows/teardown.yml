@@ -1,0 +1,104 @@
+name: teardown
+
+# Manual only. There is no push trigger and there never should be.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DESTROY to confirm. Anything else aborts.'
+        required: true
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-production      # shares the deploy lock: never both at once
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  PREFIX: mcb
+
+jobs:
+  destroy:
+    name: delete every stack except bootstrap
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: check confirmation
+        if: inputs.confirm != 'DESTROY'
+        run: |
+          echo "Confirmation was '${{ inputs.confirm }}', not DESTROY. Aborting."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: assume deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-teardown-${{ github.run_id }}
+
+      # Proven necessary, not assumed: a delete with objects in the buckets
+      # fails with `409 ... not empty`, and ONLY the buckets fail. DynamoDB
+      # tables and the ECR repository (EmptyOnDelete) clean themselves up.
+      #
+      # The artifacts bucket is skipped: it belongs to mcb-bootstrap, which
+      # this workflow deliberately does not touch.
+      - name: empty application buckets
+        run: |
+          for b in $(aws s3api list-buckets \
+                       --query "Buckets[?starts_with(Name,'${PREFIX}-')].Name" \
+                       --output text); do
+            case "$b" in
+              ${PREFIX}-artifacts-*) echo "skip $b (bootstrap-owned)"; continue ;;
+            esac
+            echo "emptying $b"
+            aws s3 rm "s3://$b" --recursive --only-show-errors || true
+          done
+
+      # Reverse of creation order. A stack that does not exist is not an
+      # error - teardown has to be re-runnable after a partial failure.
+      - name: delete stacks
+        run: |
+          for s in agent tools knowledge data foundation; do
+            name="${PREFIX}-${s}"
+            if aws cloudformation describe-stacks --stack-name "$name" >/dev/null 2>&1; then
+              echo "::group::deleting $name"
+              aws cloudformation delete-stack --stack-name "$name" \
+                --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+              aws cloudformation wait stack-delete-complete --stack-name "$name" || {
+                echo "delete failed for $name; reasons:"
+                aws cloudformation describe-stack-events --stack-name "$name" \
+                  --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+                  --output text
+                exit 1
+              }
+              echo "::endgroup::"
+            else
+              echo "$name absent, nothing to do"
+            fi
+          done
+
+      # A verification, not a hope. Note the exclusions: mcb-bootstrap and its
+      # artifacts bucket are SUPPOSED to survive - they are what this workflow
+      # authenticated with. Without excluding them the check would fail on
+      # every successful teardown, which is an alarm nobody would keep.
+      - name: verify nothing survives
+        run: |
+          survivors=$(aws resourcegroupstaggingapi get-resources \
+            --tag-filters "Key=Project,Values=${PREFIX}" \
+            --query 'ResourceTagMappingList[].ResourceARN' --output text \
+            | tr '\t' '\n' \
+            | grep -v ":stack/${PREFIX}-bootstrap/" \
+            | grep -v ":::${PREFIX}-artifacts-" \
+            | sed '/^$/d' || true)
+          if [ -n "$survivors" ]; then
+            echo "these resources outlived teardown:"
+            echo "$survivors"
+            exit 1
+          fi
+          echo "clean: only mcb-bootstrap and its artifacts bucket remain, by design"

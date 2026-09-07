@@ -1,0 +1,60 @@
+name: test
+
+# Runs on every push and every pull request, INCLUDING pull requests from
+# forks. The repository is public, so anyone can open one.
+#
+# That is why this workflow has no credentials and no `id-token` permission.
+# A fork PR runs the test suite and can reach nothing in AWS. Deployment lives
+# in a separate workflow that only triggers on push to main, which a fork
+# cannot do.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read        # deliberately no id-token
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline suite
+    runs-on: ubuntu-24.04
+    env:
+      NO_AWS: '1'
+      MOCK_LLM: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: sync dependencies
+        run: uv sync --group dev
+
+      - name: build corpus
+        run: uv run python scripts/build_corpus.py
+
+      # The live-marked tests call Bedrock and cost money; they are excluded
+      # here and run deliberately, not on every push.
+      - name: pytest
+        run: uv run pytest -m "not live" -q
+
+  templates:
+    name: template lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cfn-lint
+        run: pipx install cfn-lint
+
+      # Catches a bad !GetAtt or an unknown property before a stack rollback
+      # spends ten minutes proving the same thing.
+      - name: lint every template
+        run: cfn-lint infra/*/template.yaml --format parseable

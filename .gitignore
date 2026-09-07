@@ -1,0 +1,11 @@
+*.log
+*.pyc
+.env
+.pytest_cache/
+.venv/
+__pycache__/
+data/generated/
+dist/
+venv/
+.aws-sam/
+response.json

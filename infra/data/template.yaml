@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  mcb-data - Redshift Serverless, the VPC it lives in, and the migrate Lambda
+  that seeds it. Slow to create and then almost never changed, which is why it
+  is not in the same stack as the agent.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  DbName:
+    Type: String
+    Default: mcb
+    Description: The new database, per build requirement 1.
+  AdminUsername:
+    Type: String
+    Default: mcbadmin
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Sourced by the deploy workflow from SSM Parameter Store and passed as an
+      override. It is never written into a template or a repository.
+  BaseCapacity:
+    Type: Number
+    Default: 8
+    Description: >
+      Base RPU. The floor is 4 in some regions and 8 in others; 8 is the safe
+      default. Compute is billed only while a query runs, so this sets the
+      cost of a burst, not a standing charge.
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+
+Resources:
+
+  # ---------------------------------------------------------------- network
+  # A VPC with NO NAT GATEWAY and no interface endpoints. That is a deliberate
+  # cost decision: a NAT is ~$32/month standing, and interface endpoints are
+  # ~$7.30/month each per AZ. Gateway endpoints for S3 and DynamoDB are free,
+  # and they are the only AWS services anything in here needs to reach.
+  #
+  # The consequence shapes the design: the migrate Lambda cannot call an AWS
+  # API from inside this VPC, so its database password arrives as an
+  # environment variable rather than being fetched at runtime.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-vpc" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  # Three subnets in three AZs. Redshift Serverless requires three when
+  # enhanced VPC routing is on, and two otherwise; three costs nothing extra
+  # and removes the constraint entirely.
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 3, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-private-a" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 3, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-private-b" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  SubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 3, 8]]
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-private-c" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-private" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  # No default route. There is deliberately no way out of this VPC.
+  RouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable }
+  RouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable }
+  RouteAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetC, RouteTableId: !Ref RouteTable }
+
+  # Free. These are the two that have gateway endpoints; everything else
+  # would cost money, which is why nothing else is reached from in here.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RouteTable]
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RouteTable]
+
+  # One security group for both the Lambda and the workgroup. The ingress
+  # rule is self-referencing: members can reach each other on 5439 and
+  # nothing outside the group can reach either.
+  DataSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${Prefix} Redshift and the Lambdas that query it"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: !Ref VpcCidr
+          Description: VPC-internal only; there is no route out regardless.
+      Tags:
+        - { Key: Name, Value: !Sub "${Prefix}-data" }
+        - { Key: Project, Value: !Ref Prefix }
+
+  DataSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DataSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5439
+      ToPort: 5439
+      SourceSecurityGroupId: !Ref DataSecurityGroup
+      Description: Redshift, from members of this group only.
+
+  # --------------------------------------------------------------- Redshift
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-redshift"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: redshift.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: copy-from-s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}/*"
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  Namespace:
+    Type: AWS::RedshiftServerless::Namespace
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      NamespaceName: !Sub "${Prefix}-ns"
+      DbName: !Ref DbName
+      AdminUsername: !Ref AdminUsername
+      AdminUserPassword: !Ref AdminPassword
+      # No FinalSnapshotName. A final snapshot survives the stack and keeps
+      # billing for storage, which would quietly defeat the whole cost design.
+      IamRoles: [!GetAtt RedshiftRole.Arn]
+      DefaultIamRoleArn: !GetAtt RedshiftRole.Arn
+      LogExports: [userlog, connectionlog]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  Workgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    DependsOn: Namespace
+    Properties:
+      WorkgroupName: !Sub "${Prefix}-wg"
+      NamespaceName: !Sub "${Prefix}-ns"
+      BaseCapacity: !Ref BaseCapacity
+      # Private. Reachable only from inside the VPC, which is why the Lambda
+      # is in it.
+      PubliclyAccessible: false
+      EnhancedVpcRouting: false
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]
+      SecurityGroupIds: [!Ref DataSecurityGroup]
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # ---------------------------------------------------------- migrate Lambda
+  # Schema and seed data are DDL and DML, not resources, so they cannot be a
+  # template. They run here instead - and deliberately NOT as a CloudFormation
+  # custom resource, because a migration should be re-runnable without a stack
+  # update.
+  #
+  # No hand-written execution role: SAM generates one from Policies below.
+  MigrateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-migrate"
+      CodeUri: migrate/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]        # matches the CI runner; native wheels
+      Timeout: 600
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds: [!Ref DataSecurityGroup]
+        SubnetIds: [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]
+      Environment:
+        Variables:
+          REDSHIFT_HOST: !GetAtt Workgroup.Workgroup.Endpoint.Address
+          REDSHIFT_PORT: !GetAtt Workgroup.Workgroup.Endpoint.Port
+          REDSHIFT_DB: !Ref DbName
+          REDSHIFT_USER: !Ref AdminUsername
+          # Resolved at deploy time. The Lambda cannot call SSM from this VPC
+          # without a paid interface endpoint, so the value is handed to it
+          # rather than fetched.
+          REDSHIFT_PASSWORD: !Ref AdminPassword
+      Policies:
+        - VPCAccessPolicy: {}
+      Tags:
+        Project: !Ref Prefix
+
+  # Declared explicitly so CloudFormation owns it and teardown removes it.
+  # An auto-created /aws/lambda/* group survives the stack and keeps costing.
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-migrate"
+      RetentionInDays: 7
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${Prefix}-vpc-id" }
+  SubnetIds:
+    Value: !Join [',', [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]]
+    Export: { Name: !Sub "${Prefix}-subnet-ids" }
+  SecurityGroupId:
+    Value: !Ref DataSecurityGroup
+    Export: { Name: !Sub "${Prefix}-data-sg" }
+  RedshiftHost:
+    Value: !GetAtt Workgroup.Workgroup.Endpoint.Address
+    Export: { Name: !Sub "${Prefix}-redshift-host" }
+  RedshiftPort:
+    Value: !GetAtt Workgroup.Workgroup.Endpoint.Port
+    Export: { Name: !Sub "${Prefix}-redshift-port" }
+  RedshiftDb:
+    Value: !Ref DbName
+    Export: { Name: !Sub "${Prefix}-redshift-db" }
+  MigrateFunctionName:
+    Value: !Ref MigrateFunction
+    Export: { Name: !Sub "${Prefix}-migrate-function" }

@@ -1,0 +1,262 @@
+# Single source of truth for the fictional Protec product set.
+#
+# Every generated document (brochure, prospectus, rate table, underwriting
+# guide) renders from this file - scripts/build_corpus.py. Write them
+# independently and the brochure will say 30 days where the wording says 45;
+# an insurance panel catches that in five minutes.
+#
+# Figures are synthesised for a fictional insurer but shaped on the real
+# Indian market: the third-party premiums and the owner-driver CPA cover are
+# the published IRDAI slabs, GST is the actual 18%, and the pre-existing
+# disease change below mirrors the 2024 health master circular that cut the
+# maximum waiting period from 48 months to 36.
+
+meta:
+  config_version: "2026.09.1"        # NF-4: versioned, effective-dated
+  effective_from: "2026-04-01"
+  insurer: Protec General Insurance
+  disclaimer: >-
+    Fictional insurer. Product names, UINs and figures are synthesised for a
+    demonstration and are not an offer of insurance.
+
+health:
+  - product_id: PHS
+    name: Protec Health Secure
+    uin: PROTHLIP26001V012526
+    type: indemnity
+    sum_insured: [300000, 500000, 1000000, 2000000]
+    min_age: 18
+    max_age: 65
+    child_min_age_days: 91
+    base_rate_per_lakh: 1180        # age band 18-35, zone B, per lakh, annual
+    age_loading:                    # multiplicative on base
+      "18-35": 1.00
+      "36-45": 1.35
+      "46-55": 1.90
+      "56-65": 2.80
+    zone_factor: { A: 1.15, B: 1.00, C: 0.88 }
+    floater_discount: 0.25          # applied to 2nd and subsequent members
+    waiting_periods:                # CURRENT wording - see versions below
+      initial_days: 30
+      ped_months: 36
+      specific_ailments_months: 24
+      maternity_months: 36
+    moratorium_months: 60
+    room_rent: "Single private room, no cap"
+    copay: "Nil below age 61; 20% for entry age 61 and above"
+    pre_hospitalisation_days: 60
+    post_hospitalisation_days: 90
+    day_care_procedures: 587
+    restoration: "100% of sum insured, once per policy year, unrelated illness"
+    free_look_days: 30
+    grace_period_days: 30
+    portability: "Accepted with continuity credit for waiting periods served"
+    exclusions:
+      - "Cosmetic or plastic surgery unless following an accident or cancer"
+      - "Treatment for obesity or weight control below the stated BMI criteria"
+      - "Injury from participation in hazardous or adventure sports"
+      - "War, invasion, nuclear or radioactive contamination"
+      - "Unproven treatments and experimental therapies"
+    claim_documents:
+      - "Duly signed claim form"
+      - "Discharge summary and final hospital bill"
+      - "Investigation reports supporting the diagnosis"
+      - "KYC of the proposer where the claim exceeds Rs 1,00,000"
+    addons:
+      - { code: OPD, name: OPD and diagnostics, rate_pct: 0.12 }
+      - { code: MAT, name: Maternity cover, rate_pct: 0.18 }
+      - { code: CRI, name: Critical illness rider, rate_pct: 0.09 }
+    # KB-6: two effective-dated versions of ONE wording. A query about a held
+    # policy is answered against the version in force on the POLICY date,
+    # not the version in force today.
+    versions:
+      - version: V1
+        effective_from: "2025-04-01"
+        effective_to: "2026-03-31"
+        note: >-
+          Pre-amendment wording. Pre-existing disease waiting period of 48
+          months and an eight-year moratorium.
+        waiting_periods:
+          initial_days: 30
+          ped_months: 48
+          specific_ailments_months: 24
+          maternity_months: 36
+        moratorium_months: 96
+      - version: V2
+        effective_from: "2026-04-01"
+        effective_to: null
+        note: >-
+          Current wording. Pre-existing disease waiting period reduced to 36
+          months and the moratorium to five years, applied to policies
+          incepted or renewed on or after 1 April 2026.
+        waiting_periods:
+          initial_days: 30
+          ped_months: 36
+          specific_ailments_months: 24
+          maternity_months: 36
+        moratorium_months: 60
+
+  - product_id: PHST
+    name: Protec Health Super Top-Up
+    uin: PROTHLIP26002V012526
+    type: top_up
+    sum_insured: [500000, 1000000, 2500000]
+    deductible: [300000, 500000]
+    min_age: 18
+    max_age: 70
+    base_rate_per_lakh: 280
+    age_loading: { "18-35": 1.00, "36-45": 1.25, "46-55": 1.70, "56-70": 2.40 }
+    zone_factor: { A: 1.10, B: 1.00, C: 0.90 }
+    floater_discount: 0.30
+    waiting_periods:
+      initial_days: 30
+      ped_months: 24
+      specific_ailments_months: 24
+    moratorium_months: 60
+    room_rent: "Single private room"
+    copay: "Nil"
+    pre_hospitalisation_days: 30
+    post_hospitalisation_days: 60
+    day_care_procedures: 587
+    restoration: "Not applicable on a deductible product"
+    free_look_days: 30
+    grace_period_days: 30
+    portability: "Accepted from another top-up only"
+    exclusions:
+      - "Claims below the chosen deductible in the policy year"
+      - "Cosmetic or plastic surgery unless following an accident or cancer"
+      - "War, invasion, nuclear or radioactive contamination"
+    claim_documents:
+      - "Duly signed claim form"
+      - "Settlement or denial letter from the base policy insurer"
+      - "Discharge summary and final hospital bill"
+    addons: []
+
+  - product_id: PHSR
+    name: Protec Health Senior Care
+    uin: PROTHLIP26003V012526
+    type: indemnity
+    sum_insured: [300000, 500000, 1000000]
+    min_age: 61
+    max_age: 80
+    base_rate_per_lakh: 2450
+    age_loading: { "61-70": 1.00, "71-80": 1.45 }
+    zone_factor: { A: 1.12, B: 1.00, C: 0.90 }
+    floater_discount: 0.15
+    waiting_periods:
+      initial_days: 30
+      ped_months: 24
+      specific_ailments_months: 24
+    moratorium_months: 60
+    room_rent: "Shared room; single private room on sum insured 10,00,000"
+    copay: "20% on every claim"
+    pre_hospitalisation_days: 60
+    post_hospitalisation_days: 90
+    day_care_procedures: 587
+    restoration: "50% of sum insured, once per policy year"
+    free_look_days: 30
+    grace_period_days: 30
+    portability: "Accepted with continuity credit for waiting periods served"
+    exclusions:
+      - "Treatment arising from a condition not declared at proposal"
+      - "Cosmetic or plastic surgery unless following an accident or cancer"
+      - "Non-allopathic treatment outside a recognised AYUSH hospital"
+    claim_documents:
+      - "Duly signed claim form"
+      - "Discharge summary and final hospital bill"
+      - "Pre-policy medical check-up report where one was called for"
+    addons:
+      - { code: OPD, name: OPD and diagnostics, rate_pct: 0.15 }
+      - { code: CRI, name: Critical illness rider, rate_pct: 0.11 }
+
+motor:
+  - product_id: PMS
+    name: Protec Motor Shield
+    uin: PROTMOMP26001V012526
+    type: comprehensive
+    vehicle_class: private_car
+    od_base_rate_pct: 3.05          # % of IDV, before depreciation banding
+    od_age_loading:                 # by vehicle age in years
+      "0-3": 1.00
+      "3-5": 1.12
+      "5-10": 1.28
+      "10+": 1.45
+    tp_premium: 2094                # IRDAI slab, private car 1000-1500cc
+    cpa_premium: 330                # owner-driver, Rs 15,00,000 cover
+    ncb_slabs: { "0": 0, "1": 20, "2": 25, "3": 35, "4": 45, "5": 50 }
+    free_look_days: 30
+    grace_period_days: 0
+    od_claim_tat_days: 7
+    exclusions:
+      - "Consequential loss, depreciation and normal wear and tear"
+      - "Damage while driving without a valid licence or under the influence"
+      - "Use outside the stated limitations of use"
+      - "Mechanical or electrical breakdown"
+    claim_documents:
+      - "Duly signed claim form"
+      - "Copy of the registration certificate and driving licence"
+      - "FIR where there is theft or third-party injury"
+      - "Repair estimate from the garage"
+    addons:
+      - { code: ZD,  name: Zero depreciation, rate_pct: 0.22 }
+      - { code: RSA, name: Roadside assistance, flat: 599 }
+      - { code: EP,  name: Engine protect, rate_pct: 0.14 }
+      - { code: CS,  name: Consumables, rate_pct: 0.06 }
+
+  - product_id: PTS
+    name: Protec Two-Wheeler Shield
+    uin: PROTMOMP26002V012526
+    type: comprehensive
+    vehicle_class: two_wheeler
+    od_base_rate_pct: 2.15
+    od_age_loading:
+      "0-3": 1.00
+      "3-5": 1.10
+      "5-10": 1.22
+      "10+": 1.40
+    tp_premium: 714                 # IRDAI slab, two-wheeler 75-150cc
+    cpa_premium: 330
+    ncb_slabs: { "0": 0, "1": 20, "2": 25, "3": 35, "4": 45, "5": 50 }
+    free_look_days: 30
+    grace_period_days: 0
+    od_claim_tat_days: 5
+    exclusions:
+      - "Consequential loss, depreciation and normal wear and tear"
+      - "Damage while driving without a valid licence or under the influence"
+      - "Mechanical or electrical breakdown"
+    claim_documents:
+      - "Duly signed claim form"
+      - "Copy of the registration certificate and driving licence"
+      - "FIR where there is theft or third-party injury"
+    addons:
+      - { code: ZD,  name: Zero depreciation, rate_pct: 0.18 }
+      - { code: RSA, name: Roadside assistance, flat: 299 }
+
+tax:
+  gst_pct: 18
+
+# CO-5: the gate chain enforced before issuance. Declared here so the chain
+# is configuration rather than code, and so the corpus can document it.
+gates:
+  health:
+    - { id: kyc,     name: KYC verification,       blocking: true }
+    - { id: uw,      name: Underwriting decision,  blocking: true }
+    - { id: payment, name: Premium realisation,    blocking: true }
+  motor:
+    - { id: kyc,        name: KYC verification,    blocking: true }
+    - { id: inspection, name: Pre-inspection,      blocking: true }
+    - { id: payment,    name: Premium realisation, blocking: true }
+
+# Underwriting referral rules. The model never decides eligibility - it asks
+# for a decision and quotes what comes back.
+underwriting:
+  health:
+    ppmc_age_threshold: 45
+    ppmc_declared_conditions: [diabetes, hypertension, cardiac, thyroid]
+    referral_sum_insured: 1000000
+    auto_decline_conditions: [active_malignancy, end_stage_renal_disease]
+  motor:
+    inspection_required_when:
+      - "Break-in of more than 90 days since the previous policy expired"
+      - "Prior policy was third-party only and comprehensive is now sought"
+      - "IDV above Rs 20,00,000"

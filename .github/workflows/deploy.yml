@@ -1,0 +1,141 @@
+name: deploy
+
+# Push to main, or run by hand. A fork cannot push to main, so a fork cannot
+# reach AWS through this workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'app/**'
+      - 'scripts/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      stacks:
+        description: 'Which stacks to deploy (all | foundation | data)'
+        required: false
+        default: all
+
+permissions:
+  id-token: write       # the OIDC token; this is what makes the role work
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false     # never interrupt a stack mid-update
+
+env:
+  AWS_REGION: ap-south-1
+  PREFIX: mcb
+
+jobs:
+
+  foundation:
+    name: mcb-foundation
+    runs-on: ubuntu-24.04
+    environment: production
+    if: >-
+      github.event_name == 'push' ||
+      contains(fromJSON('["all","foundation"]'), inputs.stacks)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: assume deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-foundation-${{ github.run_id }}
+
+      # Every deploy passes --role-arn. CloudFormation does the creating, not
+      # this workflow: the deploy role can drive CloudFormation and pass
+      # exactly one role, and cannot create a resource directly.
+      - name: deploy
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/foundation/template.yaml \
+            --stack-name ${PREFIX}-foundation \
+            --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} \
+            --parameter-overrides Prefix=${PREFIX} \
+            --tags Project=${PREFIX} \
+            --no-fail-on-empty-changeset
+
+      - name: report
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${PREFIX}-foundation \
+            --query 'Stacks[0].Outputs' --output table
+
+  data:
+    name: mcb-data
+    runs-on: ubuntu-24.04
+    environment: production
+    needs: foundation
+    if: >-
+      always() && needs.foundation.result != 'failure' && (
+        github.event_name == 'push' ||
+        contains(fromJSON('["all","data"]'), inputs.stacks))
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install SAM
+        run: pip install --quiet aws-sam-cli
+
+      - name: assume deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-data-${{ github.run_id }}
+
+      # This is the whole reason the build happens here rather than on a
+      # laptop: `sam build` on Windows resolves Windows wheels for psycopg,
+      # and the fix that normally applies (--use-container) needs Docker.
+      # On a Linux runner the wheels are simply correct.
+      - name: sam build
+        run: sam build --template infra/data/template.yaml --build-dir .aws-sam/data
+
+      # Parameter Store is the store of record for the password. It is read
+      # here and passed as a NoEcho override, because the migrate Lambda sits
+      # in a VPC with no NAT and cannot reach the SSM API itself.
+      - name: read redshift password
+        id: pw
+        run: |
+          PW=$(aws ssm get-parameter --name "/${PREFIX}/redshift/admin-password" \
+                 --with-decryption --query 'Parameter.Value' --output text)
+          echo "::add-mask::$PW"
+          echo "value=$PW" >> "$GITHUB_OUTPUT"
+
+      - name: sam deploy
+        run: |
+          sam deploy \
+            --template-file .aws-sam/data/template.yaml \
+            --stack-name ${PREFIX}-data \
+            --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} \
+            --s3-bucket ${{ vars.AWS_ARTIFACTS_BUCKET }} \
+            --s3-prefix ${PREFIX}-data \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --tags Project=${PREFIX} \
+            --parameter-overrides \
+              Prefix=${PREFIX} \
+              AdminPassword='${{ steps.pw.outputs.value }}'
+
+      # The imperative half: schema and seed are DDL, not resources. The
+      # function is idempotent, so running it on every deploy is safe.
+      - name: run migrations
+        run: |
+          aws lambda invoke \
+            --function-name ${PREFIX}-migrate \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{}' \
+            --cli-read-timeout 600 \
+            response.json
+          cat response.json
+          grep -q '"ok": *true' response.json

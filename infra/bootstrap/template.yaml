@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcb-bootstrap - the trust that lets GitHub Actions deploy, and nothing else.
+  Applied once from a laptop SSO session. Never deleted by CI, because it is
+  what CI authenticates with.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    Description: Name prefix for every resource this project owns.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  GitHubOwner:
+    Type: String
+    Default: skamalj
+  GitHubRepo:
+    Type: String
+    Default: multi-channel-bot
+  DeployBranch:
+    Type: String
+    Default: main
+    Description: The only branch permitted to assume the deploy role.
+
+Resources:
+
+  # ------------------------------------------------------------------ OIDC
+  # The account had no GitHub provider before this stack. One provider serves
+  # every repository in the account, which is exactly why the ROLE's trust
+  # condition below has to be exact - the provider is not the boundary.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # ------------------------------------------------------- deploy artifacts
+  # This bucket belongs to the DEPLOY process, not the application, so it
+  # lives here rather than in mcb-foundation. `sam package` needs somewhere to
+  # upload to before the first application stack exists.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Prefix}-artifacts-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          # Build artifacts are worthless a fortnight after the deploy that
+          # used them, and they are the only thing here with a running cost.
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 14
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # ------------------------------------------------- CloudFormation executor
+  # CloudFormation creates every resource using THIS role. GitHub cannot
+  # assume it - only cloudformation.amazonaws.com can. That split is what
+  # stops a compromised workflow from minting itself an administrator: the
+  # workflow can deploy this template, but it cannot create a role directly.
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-cfn-exec"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: provision
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Services this project provisions. Broad within each service,
+              # because CloudFormation must be able to create, update, tag,
+              # read back and delete every resource type in six templates.
+              - Sid: Services
+                Effect: Allow
+                Action:
+                  - dynamodb:*
+                  - s3:*
+                  - s3vectors:*
+                  - ecr:*
+                  - lambda:*
+                  - logs:*
+                  - ssm:*
+                  - ec2:*                     # VPC, subnets, SGs, endpoints
+                  - redshift-serverless:*
+                  - redshift:GetClusterCredentials
+                  - bedrock:*
+                  - bedrock-agentcore:*
+                  - application-autoscaling:*
+                  - tag:*
+                Resource: '*'
+              # IAM is the dangerous one, so it is the one that is scoped:
+              # this role may only touch roles whose name starts with the
+              # project prefix, and may not attach arbitrary managed policies
+              # beyond the AWS service-managed set.
+              - Sid: ProjectRolesOnly
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-*"
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # -------------------------------------------------------- GitHub deploy role
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-github-deploy"
+      Description: Assumed by GitHub Actions via OIDC. Drives CloudFormation only.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: !Ref GitHubOidcProvider }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # No wildcards. `repo:owner/*` would let ANY repository on
+                # this account assume the deploy role, and the repository is
+                # public.
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DeployBranch}"
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:production"
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DriveCloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Prefix}-*/*"
+              - Sid: ReadOnlyDiscovery
+                Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:ValidateTemplate
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              # The single most important statement in this template: the
+              # deploy role may hand CloudFormation exactly ONE role.
+              - Sid: PassOnlyTheExecutor
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: PackageArtifacts
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+              - Sid: PushImages
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                Resource: '*'
+              # The imperative steps that no template can express: seed the
+              # database, sync the corpus, start ingestion.
+              - Sid: PostDeploySteps
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-migrate"
+              - Sid: CorpusAndIngestion
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}/*"
+              - Sid: StartIngestion
+                Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                  - bedrock:GetIngestionJob
+                  - bedrock:ListIngestionJobs
+                  - bedrock:GetKnowledgeBase
+                Resource: '*'
+              # Teardown has to be able to empty buckets before the stack that
+              # owns them can be deleted.
+              - Sid: TeardownEmptyBuckets
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-*/*"
+              # The Redshift password lives in Parameter Store and is read
+              # here at deploy time, then passed to CloudFormation as a
+              # NoEcho override. It is never in the repository, and the
+              # Lambda that needs it is in a VPC that cannot reach SSM.
+              - Sid: ReadDeployParameters
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Prefix}/*"
+              - Sid: TeardownVerify
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+Outputs:
+  DeployRoleArn:
+    Description: Set as the GitHub repository variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt DeployRole.Arn
+    Export: { Name: !Sub "${Prefix}-deploy-role-arn" }
+  CfnExecRoleArn:
+    Description: Passed to CloudFormation as --role-arn on every deploy.
+    Value: !GetAtt CfnExecRole.Arn
+    Export: { Name: !Sub "${Prefix}-cfn-exec-role-arn" }
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export: { Name: !Sub "${Prefix}-artifacts-bucket" }
+  OidcProviderArn:
+    Value: !Ref GitHubOidcProvider

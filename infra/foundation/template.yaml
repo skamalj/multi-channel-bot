@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcb-foundation - state that outlives every deploy. Four DynamoDB tables, the
+  document and corpus buckets, and the container registry. Low churn: nothing
+  here changes when the agent changes.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  SessionTtlDays:
+    Type: Number
+    Default: 30
+    Description: Bot thread (user#lob). Matches settings.session_ttl_days.
+  ResolverTtlDays:
+    Type: Number
+    Default: 180
+    Description: Resolver thread (user). Matches settings.resolver_ttl_days.
+  AuditTtlDays:
+    Type: Number
+    Default: 2555
+    Description: Seven years. The record outlives the session by design.
+
+Resources:
+
+  # ------------------------------------------------------- checkpoint tables
+  # Two checkpointers, keyed apart (ME-1, ME-2). Same shape, different
+  # retention: a bot thread is a journey, a resolver thread is a person's
+  # route history and is kept six times longer.
+  #
+  # Key schema is not a choice made here - it is what app/memory/checkpoint.py
+  # writes: pk = thread id, sk = "cp#{ns}#{id}" or "wr#{ns}#{id}#{task}#{idx}".
+  CheckpointsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${Prefix}-checkpoints"
+      BillingMode: PAY_PER_REQUEST      # no idle cost, and load is bursty
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: RetentionDays, Value: !Ref SessionTtlDays }
+
+  ResolverTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${Prefix}-resolver"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: RetentionDays, Value: !Ref ResolverTtlDays }
+
+  # ----------------------------------------------------- long-term key/value
+  # app/memory/backend.py writes a single hash key and a JSON body, so these
+  # two are hash-only. Prefix scans are how erasure finds a subject's rows.
+  ProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${Prefix}-profiles"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${Prefix}-audit"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+        - { Key: RetentionDays, Value: !Ref AuditTtlDays }
+
+  # ------------------------------------------------------------------ buckets
+  # Two buckets, because they have different readers and different lifetimes.
+  # Documents are customer data written at runtime; the corpus is the RAG
+  # source, read by the Knowledge Base service role and by nothing else.
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${Prefix}-documents-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  CorpusBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${Prefix}-corpus-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # --------------------------------------------------------------------- ECR
+  # EmptyOnDelete is the whole reason teardown does not need a manual step
+  # here: a repository holding images normally refuses to delete.
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub "${Prefix}-agent"
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        # Image layers are the largest standing cost in the whole account,
+        # so old builds do not accumulate.
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "keep the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+Outputs:
+  CheckpointsTableName:
+    Value: !Ref CheckpointsTable
+    Export: { Name: !Sub "${Prefix}-checkpoints-table" }
+  ResolverTableName:
+    Value: !Ref ResolverTable
+    Export: { Name: !Sub "${Prefix}-resolver-table" }
+  ProfilesTableName:
+    Value: !Ref ProfilesTable
+    Export: { Name: !Sub "${Prefix}-profiles-table" }
+  AuditTableName:
+    Value: !Ref AuditTable
+    Export: { Name: !Sub "${Prefix}-audit-table" }
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+    Export: { Name: !Sub "${Prefix}-documents-bucket" }
+  DocumentsBucketArn:
+    Value: !GetAtt DocumentsBucket.Arn
+    Export: { Name: !Sub "${Prefix}-documents-bucket-arn" }
+  CorpusBucketName:
+    Value: !Ref CorpusBucket
+    Export: { Name: !Sub "${Prefix}-corpus-bucket" }
+  CorpusBucketArn:
+    Value: !GetAtt CorpusBucket.Arn
+    Export: { Name: !Sub "${Prefix}-corpus-bucket-arn" }
+  AgentRepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri
+    Export: { Name: !Sub "${Prefix}-agent-repo-uri" }

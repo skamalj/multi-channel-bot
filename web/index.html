@@ -1,0 +1,310 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Protec bot - test console</title>
+<style>
+  :root{
+    --paper:#eef1f3; --surface:#fff; --sunk:#e5eaed; --ink:#0f1519; --ink2:#33454f;
+    --muted:#66808c; --rule:#cfd8dd; --steel:#16607f; --steelbg:#dceaf0;
+    --ok:#20624a; --okbg:#dcece5; --warn:#8f5410; --warnbg:#f6ecdd;
+    --crit:#98322a; --critbg:#f6e3e1;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --paper:#0b1114; --surface:#121b20; --sunk:#162128; --ink:#e6edf0; --ink2:#adc0c8;
+    --muted:#7e959e; --rule:#22333b; --steel:#5cb4d6; --steelbg:#0e2f3e;
+    --ok:#5eb08c; --okbg:#112a21; --warn:#d5a05c; --warnbg:#2b2214;
+    --crit:#dd857c; --critbg:#2e1c19;}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font:14px/1.55 -apple-system,"Segoe UI",Roboto,sans-serif;height:100vh;
+       display:grid;grid-template-rows:auto 1fr}
+  header{display:flex;gap:12px;align-items:center;padding:9px 14px;
+         background:var(--surface);border-bottom:1px solid var(--rule);flex-wrap:wrap}
+  header b{font-size:14px;letter-spacing:-.01em}
+  select,input,button{font:inherit;padding:5px 8px;border:1px solid var(--rule);
+         border-radius:5px;background:var(--surface);color:var(--ink)}
+  button{background:var(--steel);color:#fff;border-color:var(--steel);cursor:pointer}
+  button.ghost{background:transparent;color:var(--ink2);border-color:var(--rule)}
+  button.ghost:hover{background:var(--sunk)}
+  main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);
+       gap:1px;background:var(--rule);overflow:hidden}
+  section{background:var(--surface);display:flex;flex-direction:column;min-height:0}
+  h2{margin:0;padding:8px 13px;font:500 10px/1 var(--mono);letter-spacing:.14em;
+     text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--rule);
+     display:flex;justify-content:space-between;align-items:center;gap:8px}
+  #log,#trace{flex:1;overflow:auto;padding:13px}
+  .msg{max-width:84%;padding:8px 11px;border-radius:9px;margin-bottom:9px;
+       border:1px solid var(--rule);background:var(--sunk);white-space:pre-wrap}
+  .msg.me{margin-left:auto;background:var(--steelbg);border-color:var(--steel)}
+  .who{font:500 9px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+       color:var(--muted);display:block;margin-bottom:4px}
+  .cite{display:inline-block;font:500 9.5px/1.4 var(--mono);padding:1px 4px;
+        border-radius:3px;background:var(--okbg);color:var(--ok);
+        border:1px solid var(--rule);cursor:help}
+  form{display:flex;gap:8px;padding:9px 13px;border-top:1px solid var(--rule)}
+  form input{flex:1}
+  .ev{border-bottom:1px dotted var(--rule);padding:5px 0;font-family:var(--mono);
+      font-size:11.5px;display:grid;grid-template-columns:78px 1fr;gap:9px}
+  .k{color:var(--muted)}
+  .v{min-width:0;word-break:break-word;color:var(--ink2)}
+  .pill{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;
+        margin-right:4px;background:var(--sunk);color:var(--ink2)}
+  .pill.ok{background:var(--okbg);color:var(--ok)}
+  .pill.warn{background:var(--warnbg);color:var(--warn)}
+  .pill.crit{background:var(--critbg);color:var(--crit)}
+  .pill.steel{background:var(--steelbg);color:var(--steel)}
+  .turn{font:500 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+        color:var(--steel);margin:14px 0 6px;display:flex;justify-content:space-between}
+  table.chunks{width:100%;border-collapse:collapse;font-size:10.5px;margin-top:3px}
+  table.chunks td{padding:2px 5px 2px 0;vertical-align:top;border-bottom:1px solid var(--rule)}
+  table.chunks tr.rej td{opacity:.62}
+  td.sc{font-weight:600;white-space:nowrap;width:44px}
+  td.id{white-space:nowrap;color:var(--ink2)}
+  .bar{display:inline-block;height:6px;background:var(--steel);border-radius:2px;
+       vertical-align:middle;margin-right:5px;min-width:1px}
+  tr.rej .bar{background:var(--muted)}
+  details{margin:4px 0}
+  summary{cursor:pointer;color:var(--muted);font-size:10.5px}
+  .hint{padding:9px 13px;font-size:12px;color:var(--muted);
+        border-top:1px solid var(--rule);background:var(--sunk)}
+  .hint code{cursor:pointer;color:var(--steel);font-family:var(--mono);font-size:11px}
+  @media (max-width:900px){main{grid-template-columns:1fr;grid-template-rows:1fr 1fr}}
+</style>
+
+<header>
+  <b>Protec bot - test console</b>
+  <label class="k">user
+    <input id="user" value="919820000009" size="13">
+  </label>
+  <label class="k">entry
+    <select id="entry">
+      <option value="">none (let the resolver decide)</option>
+      <option value="customer|health">customer / health</option>
+      <option value="customer|motor">customer / motor</option>
+      <option value="agent|motor">agent / motor</option>
+    </select>
+  </label>
+  <button class="ghost" id="reset">new user</button>
+  <button class="ghost" id="caps">capabilities</button>
+  <button class="ghost" id="stores">memory</button>
+  <button class="ghost" id="auditb">audit</button>
+  <button class="ghost" id="consent">grant consent</button>
+  <button class="ghost" id="stepup">step-up auth</button>
+  <span id="mode" class="pill"></span>
+  <span id="ver" class="pill"></span>
+</header>
+
+<main>
+  <section>
+    <h2>conversation</h2>
+    <div id="log"></div>
+    <form id="f">
+      <input id="t" autocomplete="off"
+             placeholder="what is the waiting period for a pre-existing disease">
+      <button>Send</button>
+    </form>
+    <div class="hint" id="hints"></div>
+  </section>
+  <section>
+    <h2>glass box <span id="ms" class="pill"></span></h2>
+    <div id="trace"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $("#log"), trace = $("#trace");
+
+const SCRIPT = [
+  ["hi", "ambiguous first turn - the resolver asks instead of guessing"],
+  ["what is the waiting period for a pre-existing disease",
+   "LOB from an entity; a cited answer, with the rejected chunks shown"],
+  ["and what about maternity", "the prior holds through an ambiguous turn"],
+  ["actually my car renewal is due", "mid-conversation switch: different bot, different tools"],
+  ["will you reimburse my Lisbon holiday and my new laptop",
+   "below the retrieval floor - it refuses and offers a human"],
+  ["please give me a health quote", "a mutating tool is proposed, not performed"],
+  ["yes", "confirmed - and the token is the idempotency key"],
+];
+
+fetch("/api/health").then(r => r.json()).then(h => {
+  $("#mode").textContent = (h.mock_llm ? "MOCK_LLM" : h.model) + " - " + h.region;
+  $("#mode").className = "pill " + (h.mock_llm ? "warn" : "ok");
+  $("#ver").textContent = `prompt ${h.prompt_version} - config ${h.config_version} - `
+    + `${h.corpus.documents} docs / ${h.corpus.chunks} chunks`;
+});
+
+$("#hints").innerHTML = "try: " + SCRIPT
+  .map(([q, why]) => `<code title="${why}">${q}</code>`).join(" &middot; ");
+$("#hints").onclick = e => {
+  if (e.target.tagName === "CODE") { $("#t").value = e.target.textContent; $("#t").focus(); }
+};
+
+// Just enough markdown for what a model actually writes: headings, bold and
+// bullets. Escaped first, so nothing in a model's output can inject markup.
+function md(s) {
+  return esc(s)
+    .replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/^\s*[-*•]\s+(.+)$/gm, "&nbsp;&nbsp;• $1");
+}
+
+function bubble(text, me) {
+  const d = document.createElement("div");
+  d.className = "msg" + (me ? " me" : "");
+  d.innerHTML = `<span class="who">${me ? "you" : "bot"}</span>`;
+  const body = document.createElement("div");
+  // Citations are rendered as chips so the provenance is visible, not noise.
+  body.innerHTML = md(String(text)).replace(
+    /\[([A-Za-z0-9][A-Za-z0-9\-.#_]{3,})\]/g,
+    `<span class="cite" title="retrieved chunk this sentence came from">$1</span>`);
+  d.appendChild(body);
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+
+function pillFor(kind) {
+  return {resolve:"steel", bind:"steel", tool:"ok", gate:"warn",
+          guardrail:"warn", error:"crit", retrieve:"ok", respond:"", llm:""}[kind] || "";
+}
+
+const SKIP = new Set(["accepted_chunks", "rejected_chunks"]);
+
+function chunkTable(accepted, rejected) {
+  const rows = [...(accepted || []).map(c => [c, false]),
+                ...(rejected || []).map(c => [c, true])];
+  if (!rows.length) return "";
+  const max = Math.max(...rows.map(([c]) => c.score || 0), 0.01);
+  const body = rows.map(([c, rej]) => `
+    <tr class="${rej ? "rej" : ""}">
+      <td class="sc">${(c.score ?? 0).toFixed(2)}</td>
+      <td><span class="bar" style="width:${Math.round(46 * (c.score || 0) / max)}px"></span></td>
+      <td class="id">${c.chunk_id}</td>
+      <td>${c.section || ""} <span class="k">- ${c.source || ""} p${c.page ?? "?"}
+          ${c.version ? "- " + c.version : ""}</span>
+          ${rej ? `<span class="pill crit">${c.rejected}</span>` : ""}</td>
+    </tr>`).join("");
+  return `<details open><summary>${(accepted || []).length} accepted,
+            ${(rejected || []).length} rejected - scores for both</summary>
+            <table class="chunks">${body}</table></details>`;
+}
+
+function renderTrace(tr, ms) {
+  const h = document.createElement("div");
+  h.className = "turn";
+  h.innerHTML = `<span>turn - ${tr.trace_id}</span><span>${ms} ms</span>`;
+  trace.appendChild(h);
+  for (const e of tr.events) {
+    const row = document.createElement("div");
+    row.className = "ev";
+    const d = e.detail || {};
+    const detail = Object.entries(d).filter(([k]) => !SKIP.has(k))
+      .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`)
+      .join("  ");
+    row.innerHTML =
+      `<div class="k"><span class="pill ${pillFor(e.kind)}">${e.kind}</span></div>` +
+      `<div class="v"><b>${esc(e.label)}</b>${e.ms != null ? ` <span class="k">${e.ms}ms</span>` : ""}` +
+      `<br><span class="k">${esc(detail)}</span>` +
+      (e.kind === "retrieve" ? chunkTable(d.accepted_chunks, d.rejected_chunks) : "") +
+      `</div>`;
+    trace.appendChild(row);
+  }
+  trace.scrollTop = trace.scrollHeight;
+}
+
+const esc = s => String(s).replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+
+function panel(title, rows) {
+  const h = document.createElement("div");
+  h.className = "turn"; h.innerHTML = `<span>${title}</span>`;
+  trace.appendChild(h);
+  for (const [k, v] of rows) {
+    const row = document.createElement("div");
+    row.className = "ev";
+    row.innerHTML = `<div class="k">${esc(k)}</div><div class="v">${v}</div>`;
+    trace.appendChild(row);
+  }
+  trace.scrollTop = trace.scrollHeight;
+}
+
+$("#f").onsubmit = async ev => {
+  ev.preventDefault();
+  const text = $("#t").value.trim(); if (!text) return;
+  $("#t").value = ""; bubble(text, true);
+  const [persona, lob] = ($("#entry").value || "|").split("|");
+  const r = await fetch("/api/chat", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({user_id: $("#user").value, text,
+                          persona: persona || null, lob: lob || null})
+  });
+  const data = await r.json();
+  (data.replies || []).forEach(m => bubble(m.text, false));
+  $("#ms").textContent = data.turn_ms + " ms";
+  renderTrace(data.trace, data.turn_ms);
+};
+
+$("#reset").onclick = () => {
+  $("#user").value = "9198200000" + Math.floor(Math.random() * 90 + 10);
+  log.innerHTML = ""; trace.innerHTML = "";
+};
+
+$("#caps").onclick = async () => {
+  const d = await (await fetch("/api/bots")).json();
+  panel("capability matrix - build time, no conversation simulated",
+    Object.entries(d.capability_matrix).map(([bot, info]) => [
+      `${bot} ${info.persona}/${info.lob}`,
+      info.tools.map(t =>
+        `${t.name} <span class="pill ${t.effect === "read" ? "" : "warn"}">${t.effect}</span>`
+        + (t.authority === "core" ? `<span class="pill steel">core</span>` : "")
+        + (t.pii ? `<span class="pill crit">pii</span>` : "")
+        + (t.confirm ? `<span class="pill warn">confirm</span>` : "")
+        + `<span class="pill">${t.auth}</span>`).join("<br>")]));
+};
+
+$("#stores").onclick = async () => {
+  const d = await (await fetch("/api/memory")).json();
+  panel("memory registry - key, ttl, sensitivity, erasure",
+    d.stores.map(s => [s.name,
+      `<span class="pill">${s.key}</span>`
+      + `<span class="pill">${s.ttl_days}d</span>`
+      + `<span class="pill ${s.sensitivity === "high" ? "crit" : ""}">${s.sensitivity}</span>`
+      + `<span class="pill ${s.crosses_lob ? "warn" : "ok"}">`
+      + `${s.crosses_lob ? "crosses lob" : "lob-scoped"}</span>`
+      + `<br><span class="k">${s.contains} - erasure: ${s.erasure}</span>`]));
+};
+
+$("#auditb").onclick = async () => {
+  const u = $("#user").value;
+  const d = await (await fetch(`/api/audit/${u}`)).json();
+  panel(`audit - keyed by person, spanning every line of business (${d.entries.length})`,
+    d.entries.slice(-12).map(e => [e.lob || "-",
+      `<b>${e.bot_id || "resolver"}</b> ${e.persona || ""} `
+      + `<span class="pill">${e.model}</span>`
+      + `<span class="pill">${e.prompt_version}/${e.config_version}</span>`
+      + `<br><span class="k">${esc((e.inbound || "").slice(0, 90))}</span>`
+      + `<br><span class="k">-> ${esc((e.outbound || "").slice(0, 140))}</span>`
+      + (e.citations && e.citations.length
+         ? `<br><span class="k">cited: ${e.citations.join(", ")}</span>` : "")]));
+};
+
+$("#consent").onclick = async () => {
+  const u = $("#user").value;
+  for (const p of ["quotation", "kyc", "payment"]) {
+    await fetch("/api/consent", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user_id: u, purpose: p, granted: true})});
+  }
+  panel("consent ledger", [["granted",
+    "quotation, kyc, payment - append-only; a withdrawal never deletes the grant"]]);
+};
+
+$("#stepup").onclick = async () => {
+  const u = $("#user").value;
+  const d = await (await fetch("/api/stepup", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({user_id: u})})).json();
+  panel("step-up authentication", [["done",
+    `authenticated=${d.authenticated} - a persona change cannot be talked into `
+    + `existence, so this is a separate act from the conversation`]]);
+};
+</script>

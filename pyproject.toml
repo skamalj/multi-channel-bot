@@ -1,0 +1,52 @@
+[project]
+name = "multi-channel-bot"
+version = "0.2.0"
+description = "Protec multi-channel insurance bot platform: persona x lob -> configuration, one MCP server, glass-box trace"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "boto3>=1.34",
+    "langchain-core>=0.3",
+    "langchain-aws>=0.2",
+    "langgraph>=0.2",
+    "mcp>=1.2",
+    "httpx>=0.27",
+    "agentstate-reducer>=0.3.0",
+]
+
+[project.optional-dependencies]
+# Only needed when the single-node agent grows real branches and the bot
+# session moves to a LangGraph checkpointer. Not on the default path.
+ddb-checkpoint = ["langgraph-dynamodb-checkpoint>=0.1"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+]
+
+[project.scripts]
+mcb-preflight = "scripts.preflight:main"
+mcb-bootstrap = "scripts.bootstrap_aws:main"
+mcb-corpus = "scripts.build_corpus:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "live: hits real AWS Bedrock - deselected by default with -m 'not live'",
+]
