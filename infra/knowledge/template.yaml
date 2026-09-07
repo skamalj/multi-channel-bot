@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcb-knowledge - RAG on a Bedrock Knowledge Base backed by S3 Vectors.
+  Semantic retrieval only, top 5, no reranking (D-4).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  EmbeddingDimension:
+    Type: Number
+    Default: 1024
+    Description: Must match the embedding model. Titan Text v2 emits 1024.
+  ChunkMaxTokens:
+    Type: Number
+    Default: 400
+  ChunkOverlapPercent:
+    Type: Number
+    Default: 15
+
+Resources:
+
+  # ----------------------------------------------------------- vector store
+  # S3 Vectors rather than OpenSearch Serverless. This is the single largest
+  # cost decision in the account: OpenSearch Serverless has a ~2 OCU floor
+  # billing roughly $350/month whether or not a query is ever run, and S3
+  # Vectors has no floor at all - storage is about $0.06/GB-month and this
+  # corpus is a few megabytes.
+  #
+  # The trade is real and accepted: S3 Vectors does semantic search only. No
+  # hybrid lexical matching. That is exactly what D-4 asked for.
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VectorBucketName: !Sub "${Prefix}-vectors-${AWS::AccountId}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      IndexName: !Sub "${Prefix}-corpus"
+      VectorBucketName: !Ref VectorBucket
+      DataType: float32          # the only type S3 Vectors supports
+      Dimension: !Ref EmbeddingDimension
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        # The chunk text itself is stored as metadata but must never be
+        # filterable - it would blow the per-vector metadata budget and it is
+        # not something anyone filters on. The keys we DO filter on (lob and
+        # corpus_scope, KB-2) are deliberately left filterable.
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+
+  # ------------------------------------------------------------------ role
+  # Assumed by Bedrock itself, so it has to be written by hand.
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-kb"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: kb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadCorpus
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}/*"
+              - Sid: Embed
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+              - Sid: Vectors
+                Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:ListVectors
+                  - s3vectors:GetIndex
+                Resource:
+                  - !GetAtt VectorBucket.VectorBucketArn
+                  - !GetAtt VectorIndex.IndexArn
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  # -------------------------------------------------------- knowledge base
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${Prefix}-corpus"
+      Description: Protec product documents. Semantic retrieval, top 5, no reranking.
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+          IndexArn: !GetAtt VectorIndex.IndexArn
+      Tags:
+        Project: !Ref Prefix
+
+  DataSource:
+    Type: AWS::Bedrock::DataSource
+    # The ingestion job is NOT run here - CloudFormation creates the data
+    # source, and the deploy workflow starts the job. Ingestion is work, not
+    # a resource.
+    Properties:
+      Name: !Sub "${Prefix}-corpus-s3"
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}"
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: !Ref ChunkMaxTokens
+            OverlapPercentage: !Ref ChunkOverlapPercent
+
+Outputs:
+  KnowledgeBaseId:
+    Value: !Ref KnowledgeBase
+    Export: { Name: !Sub "${Prefix}-kb-id" }
+  KnowledgeBaseArn:
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseArn
+    Export: { Name: !Sub "${Prefix}-kb-arn" }
+  DataSourceId:
+    Value: !GetAtt DataSource.DataSourceId
+    Export: { Name: !Sub "${Prefix}-kb-datasource-id" }
+  VectorIndexArn:
+    Value: !GetAtt VectorIndex.IndexArn
+    Export: { Name: !Sub "${Prefix}-vector-index-arn" }

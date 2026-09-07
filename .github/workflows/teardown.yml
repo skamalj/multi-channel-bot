@@ -42,6 +42,20 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-teardown-${{ github.run_id }}
 
+      # This account has Redshift Serverless resources that predate the
+      # project and belong to no stack: `default-namespace` and
+      # `default-workgroup`. They are OUT OF SCOPE and must survive every
+      # teardown. Recorded before, checked after - so a regression that
+      # started deleting them would fail the job rather than pass quietly.
+      - name: record out-of-scope resources
+        run: |
+          aws redshift-serverless list-namespaces             --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName'             --output text | tr '	' '
+' | sort > /tmp/ns-before.txt
+          aws redshift-serverless list-workgroups             --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName'             --output text | tr '	' '
+' | sort > /tmp/wg-before.txt
+          echo "namespaces that must survive:"; cat /tmp/ns-before.txt
+          echo "workgroups that must survive:";  cat /tmp/wg-before.txt
+
       # Proven necessary, not assumed: a delete with objects in the buckets
       # fails with `409 ... not empty`, and ONLY the buckets fail. DynamoDB
       # tables and the ECR repository (EmptyOnDelete) clean themselves up.
@@ -102,3 +116,19 @@ jobs:
             exit 1
           fi
           echo "clean: only mcb-bootstrap and its artifacts bucket remain, by design"
+
+      # The other half of the guard. Deleting something the project does not
+      # own is a worse failure than leaving something behind, so this is
+      # checked last and fails the job loudly.
+      - name: out-of-scope resources still intact
+        if: always()
+        run: |
+          aws redshift-serverless list-namespaces             --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName'             --output text | tr '	' '
+' | sort > /tmp/ns-after.txt
+          aws redshift-serverless list-workgroups             --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName'             --output text | tr '	' '
+' | sort > /tmp/wg-after.txt
+          if ! diff -u /tmp/ns-before.txt /tmp/ns-after.txt             || ! diff -u /tmp/wg-before.txt /tmp/wg-after.txt; then
+            echo "TEARDOWN DELETED SOMETHING IT DOES NOT OWN"
+            exit 1
+          fi
+          echo "pre-existing Redshift namespaces and workgroups are untouched"
