@@ -125,39 +125,61 @@ jobs:
             fi
           done
 
-      # A verification, not a hope - but it has to be right about what
-      # "survives" means, in two ways.
+      # A verification, not a hope - and it has to ask the right authority.
       #
-      # 1. Some things are SUPPOSED to survive: mcb-bootstrap and its
-      #    artifacts bucket (what this workflow authenticated with), and the
-      #    SSM parameter holding the Redshift password. That parameter is the
-      #    store of record - deleting it would make the NEXT deploy fail, so
-      #    it deliberately outlives the stacks, like bootstrap does.
+      # The Resource Groups Tagging API was the obvious tool and it is the
+      # wrong one: it kept listing eight VPC endpoints and a Cognito user
+      # pool for many minutes after CloudFormation had deleted them.
+      # `describe-vpc-endpoints` and `list-user-pools` showed none of them.
+      # The tag index is eventually consistent on a timescale that outlasts
+      # any sensible retry, so a teardown that worked kept failing its own
+      # check.
       #
-      # 2. The tagging API lags. It kept returning VPC endpoints and a
-      #    Cognito user pool that CloudFormation had already deleted, so a
-      #    single query fails a teardown that actually worked. Anything still
-      #    listed after several attempts is a real orphan; anything that
-      #    disappears was just the index catching up.
+      # Each service is therefore asked about itself. Slower to write, but it
+      # answers the actual question: is anything still THERE?
       - name: verify nothing of ours survives
         run: |
-          survivors() {
-            aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=${PREFIX}" --query 'ResourceTagMappingList[].ResourceARN' --output text               | xargs -n1               | grep -v ":stack/${PREFIX}-bootstrap/"               | grep -v ":::${PREFIX}-artifacts-"               | grep -v ":parameter/${PREFIX}/"               || true
-          }
-          for attempt in 1 2 3 4 5; do
-            survivors > /tmp/survivors.txt
-            if [ ! -s /tmp/survivors.txt ]; then
-              echo "clean on attempt $attempt"
-              echo "only mcb-bootstrap, its artifacts bucket and the SSM parameters remain, by design"
-              exit 0
+          found=0
+          report() { echo "  SURVIVING $1"; found=1; }
+
+          # Stacks are the authoritative answer for everything inside them.
+          for s in foundation data knowledge tools agent; do
+            if aws cloudformation describe-stacks --stack-name ${PREFIX}-${s} >/dev/null 2>&1; then
+              report "stack ${PREFIX}-${s}"
             fi
-            echo "attempt $attempt still lists $(wc -l < /tmp/survivors.txt):"
-            cat /tmp/survivors.txt
-            sleep 30
           done
-          echo "these resources outlived teardown after five attempts:"
-          cat /tmp/survivors.txt
-          exit 1
+
+          for t in $(aws dynamodb list-tables --query "TableNames[?starts_with(@,'${PREFIX}-')]" --output text); do
+            report "dynamodb $t"
+          done
+
+          for b in $(aws s3api list-buckets --query "Buckets[?starts_with(Name,'${PREFIX}-')].Name" --output text); do
+            case "$b" in ${PREFIX}-artifacts-*) continue ;; esac
+            report "bucket $b"
+          done
+
+          for r in $(aws ecr describe-repositories --query "repositories[?starts_with(repositoryName,'${PREFIX}-')].repositoryName" --output text 2>/dev/null); do
+            report "ecr $r"
+          done
+
+          for u in $(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?starts_with(Name,'${PREFIX}-')].Id" --output text); do
+            report "cognito $u"
+          done
+
+          for v in $(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${PREFIX}" --query 'Vpcs[].VpcId' --output text); do
+            report "vpc $v"
+          done
+
+          for n in $(aws redshift-serverless list-namespaces --query "namespaces[?starts_with(namespaceName,'${PREFIX}-')].namespaceName" --output text); do
+            report "redshift namespace $n"
+          done
+
+          if [ "$found" -ne 0 ]; then
+            echo "teardown left something behind"
+            exit 1
+          fi
+          echo "clean: every service asked reports nothing of ours remains"
+          echo "(mcb-bootstrap, its artifacts bucket and the SSM parameters survive by design)"
 
       # The other half of the guard. Deleting something the project does not
       # own is a worse failure than leaving something behind, so this runs

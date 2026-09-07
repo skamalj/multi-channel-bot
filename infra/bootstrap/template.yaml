@@ -363,6 +363,18 @@ Resources:
                 Action:
                   - s3:ListAllMyBuckets
                 Resource: '*'
+              # Read-only, so teardown can ask each service whether anything
+              # of ours is still there. The tagging API is not a reliable
+              # authority for that question.
+              - Sid: TeardownExistenceSweep
+                Effect: Allow
+                Action:
+                  - dynamodb:ListTables
+                  - ecr:DescribeRepositories
+                  - cognito-idp:ListUserPools
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcEndpoints
+                Resource: '*'
       Tags:
         - { Key: Project, Value: !Ref Prefix }
 
