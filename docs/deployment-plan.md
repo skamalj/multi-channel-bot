@@ -497,3 +497,64 @@ no stack. Teardown snapshots every non-`mcb-` namespace and workgroup before
 it starts and diffs them at the end, with `if: always()`. Deleting something
 the project does not own is a worse outcome than leaving something behind, so
 it is checked last and fails loudly.
+
+---
+
+# Measured: a full deploy and a full teardown
+
+Both halves proven through GitHub Actions, against a real deployment.
+
+## Deploy — 10m 13s
+
+All five stacks, plus the imperative steps: migrations applied to Redshift,
+74 documents synced, the Knowledge Base ingestion job run to COMPLETE, the
+ARM64 image built natively and the Runtime brought to READY.
+
+Verified by using it, not by counting green jobs:
+
+    aws bedrock-agentcore invoke-agent-runtime ... --qualifier live
+
+    statusCode 200, contentType "text/event-stream; charset=utf-8"
+    RUN_STARTED -> STEP_STARTED/CUSTOM/STEP_FINISHED x2
+                -> TEXT_MESSAGE_START -> CONTENT -> END -> RUN_FINISHED
+
+That also confirmed the `runtimeSessionId` minimum of 33 characters: the
+derived SHA-256 was accepted and echoed back.
+
+## Teardown — 35m 07s
+
+| Stack | Elapsed |
+| --- | --- |
+| `mcb-agent` | 9m 47s |
+| `mcb-tools` | 1m 06s |
+| `mcb-knowledge` | 2m 38s |
+| **`mcb-data`** | **21m 03s** - Lambda Hyperplane ENIs |
+| `mcb-foundation` | 33s |
+
+Nothing of ours survives, and `mcb-bootstrap`, its artifacts bucket and the
+SSM parameters remain by design - the password parameter is the store of
+record, so deleting it would break the next deploy.
+
+## What four failed teardowns taught us
+
+Deploy was green long before teardown was. Every one of these was invisible
+from the create path:
+
+1. **`aws s3api list-buckets` needs `s3:ListAllMyBuckets`.** Denied, the
+   `for` loop iterated zero times, `|| true` swallowed it, and the stack
+   delete failed twenty-five minutes later on a bucket nobody had emptied. A
+   silent no-op is the worst failure mode there is.
+2. **Emptying a bucket needs two different ARN shapes** - `ListBucket` on the
+   bucket, `DeleteObject` on its contents. Only the second was granted.
+3. **A re-run is not an error.** A partially-failed teardown leaves the stack
+   standing with some buckets already gone.
+4. **The Resource Groups Tagging API is the wrong authority.** It listed
+   eight VPC endpoints and a Cognito user pool for minutes after
+   CloudFormation deleted them; `describe-vpc-endpoints` and
+   `list-user-pools` showed none of them. Retrying did not help, because the
+   index lags on a timescale that outlasts any sensible retry. The sweep now
+   asks each service about itself.
+
+And one design error: teardown was gated on `verify` passing, so a failed
+verification skipped it and left the entire stack standing. It now runs
+regardless - only an explicit `keep: yes` at dispatch stops it.
