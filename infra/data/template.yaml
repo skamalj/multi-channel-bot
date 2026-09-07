@@ -34,6 +34,14 @@ Parameters:
   VpcCidr:
     Type: String
     Default: 10.42.0.0/16
+  RedshiftPort:
+    Type: String
+    Default: '5439'
+    Description: >
+      Declared rather than read back from the workgroup. Endpoint.Port is an
+      Integer, and neither Fn::Sub nor a Lambda environment value will take a
+      number - so the port is SET here and used in both places, which makes
+      them agree by construction instead of by coincidence.
 
 Resources:
 
@@ -202,6 +210,7 @@ Resources:
       WorkgroupName: !Sub "${Prefix}-wg"
       NamespaceName: !Sub "${Prefix}-ns"
       BaseCapacity: !Ref BaseCapacity
+      Port: !Ref RedshiftPort
       # Private. Reachable only from inside the VPC, which is why the Lambda
       # is in it.
       PubliclyAccessible: false
@@ -234,9 +243,7 @@ Resources:
       Environment:
         Variables:
           REDSHIFT_HOST: !GetAtt Workgroup.Workgroup.Endpoint.Address
-          # !Sub, not !GetAtt: Endpoint.Port is an Integer and a Lambda
-          # environment value must be a String.
-          REDSHIFT_PORT: !Sub "${Workgroup.Workgroup.Endpoint.Port}"
+          REDSHIFT_PORT: !Ref RedshiftPort
           REDSHIFT_DB: !Ref DbName
           REDSHIFT_USER: !Ref AdminUsername
           # Resolved at deploy time. The Lambda cannot call SSM from this VPC
@@ -272,7 +279,7 @@ Outputs:
     Value: !GetAtt Workgroup.Workgroup.Endpoint.Address
     Export: { Name: !Sub "${Prefix}-redshift-host" }
   RedshiftPort:
-    Value: !GetAtt Workgroup.Workgroup.Endpoint.Port
+    Value: !Ref RedshiftPort
     Export: { Name: !Sub "${Prefix}-redshift-port" }
   RedshiftDb:
     Value: !Ref DbName
