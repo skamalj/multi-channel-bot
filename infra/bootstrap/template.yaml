@@ -113,7 +113,13 @@ Resources:
                   - redshift-serverless:*
                   - redshift:GetClusterCredentials
                   - bedrock:*
+                  # Knowledge Bases live under a DIFFERENT service prefix.
+                  # `bedrock:*` does not grant bedrock-agent:CreateKnowledgeBase,
+                  # which is the kind of thing you find out in a rollback.
+                  - bedrock-agent:*
                   - bedrock-agentcore:*
+                  # The Gateway's JWT issuer (D-1).
+                  - cognito-idp:*
                   - application-autoscaling:*
                   - tag:*
                 Resource: '*'
