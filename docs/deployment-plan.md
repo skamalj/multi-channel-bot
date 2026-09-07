@@ -417,3 +417,83 @@ name collision.
 Recommendation: **delete and let CloudFormation recreate them.** The only loss
 is existing checkpoints and audit rows, all of it demo data, and it proves the
 create path rather than papering over it. Needs a decision before Phase 1.
+
+---
+
+# What building it actually taught us
+
+Everything below replaced an assumption with a measurement.
+
+## Corrections to decisions
+
+**D-2 is now psycopg2, not psycopg3.** The Lambda reached Redshift and then
+failed on its first query with `NotSupportedError: codec not available in
+Python: 'UNICODE'`. Redshift reports its client encoding as `UNICODE`, which
+is not a codec name Python knows; psycopg2 ships a mapping from `UNICODE` to
+`utf_8` and psycopg3 does not. The pg-library decision stands - the driver
+within it does not. All 12 write tools inherit this.
+
+**D-6 needed a second look.** Parameter Store is the store of record, but the
+migrate Lambda sits in a VPC with no NAT and no interface endpoints, so it
+cannot reach the SSM API at all. The workflow reads the parameter and passes
+it as a `NoEcho` override; the function receives it as an environment
+variable. Reaching SSM from inside that VPC would have cost ~$7.30/month per
+AZ, which is more than the rest of the stack combined.
+
+## Seven failures, none of them typos
+
+| Failure | Cause |
+| --- | --- |
+| `Credentials could not be loaded` | Repository variables did not exist yet |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | GitHub sends **ID-qualified** subjects |
+| `not authorized ... transform/Serverless-2016-10-31` | The SAM transform is a resource the service role needs |
+| `REDSHIFT_PORT: expected String, found Integer` | Lambda environment values must be strings |
+| `variable ... does not resolve to a string` | `Fn::Sub` will not coerce a number either |
+| `codec not available in Python: 'UNICODE'` | psycopg3 cannot talk to Redshift |
+| `schema "mcb" does not exist` | Redshift will not see a schema made in the same batch |
+
+The OIDC one is worth keeping. The subject GitHub actually sends is
+
+    repo:skamalj@32254183/multi-channel-bot@1360189167:environment:production
+
+not the `repo:owner/repo:...` form in both AWS's and GitHub's documentation.
+The trust policy pins both. The ID-qualified form is the *stricter* of the
+two, because deleting and recreating a repository changes its id.
+
+## Teardown is a ~25 minute operation, and that is fine
+
+Measured, on the first real teardown:
+
+| Stack | Time | Why |
+| --- | --- | --- |
+| `mcb-data` | **22m 35s** | Lambda Hyperplane ENIs |
+| `mcb-foundation` | 34s | |
+
+The function was already deleted while three ENIs described as
+`AWS Lambda VPC ENI-mcb-migrate` sat `in-use`. AWS releases them on its own
+schedule, and the subnets and security group cannot go until it does. Nothing
+to fix; the waiter allows 60 minutes. Three further ENIs belonged to the
+managed VPC endpoint Redshift Serverless creates for a private workgroup -
+also service-managed, also unbilled.
+
+The cost conclusion is unchanged. The *speed* conclusion is not: a teardown
+is not something to start five minutes before you need the account clean.
+
+## Two things the delete path exposed that the create path never would
+
+1. **A non-empty bucket is the only thing that blocks a stack delete.** Proven
+   by deliberately putting an object in each bucket and watching the delete
+   fail with `409 ... not empty` on exactly two resources. DynamoDB tables and
+   the ECR repository (`EmptyOnDelete: true`) clean themselves up.
+2. **The teardown verification failed on success.** The tag sweep printed
+   "these resources outlived teardown:" followed by nothing - an empty but
+   non-zero-length string. It now writes to a file and tests `[ -s ]`. An
+   alarm that fires on every successful run is worse than no alarm.
+
+## Out of scope, and checked
+
+`default-namespace` and `default-workgroup` predate this project and belong to
+no stack. Teardown snapshots every non-`mcb-` namespace and workgroup before
+it starts and diffs them at the end, with `if: always()`. Deleting something
+the project does not own is a worse outcome than leaving something behind, so
+it is checked last and fails loudly.
