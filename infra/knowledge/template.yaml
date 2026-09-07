@@ -42,11 +42,15 @@ Resources:
 
   VectorIndex:
     Type: AWS::S3Vectors::Index
+    DependsOn: VectorBucket
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
       IndexName: !Sub "${Prefix}-corpus"
-      VectorBucketName: !Ref VectorBucket
+      # NOT !Ref VectorBucket - that returns the ARN (73 chars) and this
+      # field takes a NAME with a 63-character limit. The same expression
+      # that created the bucket is used here, with DependsOn for ordering.
+      VectorBucketName: !Sub "${Prefix}-vectors-${AWS::AccountId}"
       DataType: float32          # the only type S3 Vectors supports
       Dimension: !Ref EmbeddingDimension
       DistanceMetric: cosine

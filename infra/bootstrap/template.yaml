@@ -275,6 +275,10 @@ Resources:
                   - lambda:InvokeFunction
                 Resource:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-migrate"
+                  # The deploy probes this one for reachability after every
+                  # deploy; without it the tools stack deploys and the job
+                  # still fails.
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-tools"
               - Sid: CorpusAndIngestion
                 Effect: Allow
                 Action:
