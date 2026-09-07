@@ -66,6 +66,51 @@ def _applied(cur) -> set[str]:
     return {row[0] for row in cur.fetchall()}
 
 
+def _statements(sql: str) -> list[str]:
+    """Split a migration into individual statements.
+
+    Redshift will not see a schema created earlier in the same batch - send
+    `CREATE SCHEMA mcb; CREATE TABLE mcb.t (...)` as one string and the second
+    statement fails with `schema "mcb" does not exist`. Each statement
+    therefore goes over the wire on its own, which also means a failure names
+    the statement that caused it rather than the whole file.
+
+    The split is quote- and comment-aware, because a `;` inside a string
+    literal or a `--` comment is not a statement boundary.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "-" and sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j + 1
+            buf.append("\n")
+            continue
+        if ch == ";":
+            out.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return [t.strip() for t in out if t.strip()]
+
+
 def _pending() -> list[pathlib.Path]:
     if not MIGRATIONS.is_dir():
         return []
@@ -90,9 +135,12 @@ def handler(event, context):            # noqa: ANN001, ARG001
 
 
             for path in pending:
-                sql = path.read_text(encoding="utf-8")
-                log.info("applying %s (%d bytes)", path.name, len(sql))
-                cur.execute(sql)
+                stmts = _statements(path.read_text(encoding="utf-8"))
+                log.info("applying %s (%d statements)", path.name, len(stmts))
+                for k, stmt in enumerate(stmts, 1):
+                    log.info("  [%s %d/%d] %s", path.name, k, len(stmts),
+                             stmt.splitlines()[0][:80])
+                    cur.execute(stmt)
                 # The existence check and the insert are in the same
                 # transaction as the migration itself, so a failure halfway
                 # leaves neither the change nor the ledger row.
