@@ -168,8 +168,13 @@ jobs:
           uv sync --group dev
           uv run python scripts/build_corpus.py
           BUCKET=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation --query "Stacks[0].Outputs[?OutputKey=='CorpusBucketName'].OutputValue" --output text)
-          aws s3 sync data/generated/corpus "s3://$BUCKET/corpus/" --delete --only-show-errors
+          aws s3 sync data/generated/documents "s3://$BUCKET/corpus/" --delete --only-show-errors --exclude "*" --include "*.md"
           aws s3 ls "s3://$BUCKET/corpus/" --recursive --summarize | tail -3
+          # 74 markdown documents. An empty sync would ingest nothing and
+          # still report success, so assert on the count.
+          n=$(aws s3 ls "s3://$BUCKET/corpus/" --recursive | grep -c '\.md$' || true)
+          echo "$n documents in the corpus bucket"
+          [ "$n" -ge 70 ] || { echo "expected ~74 documents, found $n"; exit 1; }
 
       # CloudFormation creates the data source; running the job is work.
       - name: start ingestion
