@@ -144,7 +144,7 @@ jobs:
 
       - name: deploy
         run: |
-          aws cloudformation deploy --template-file infra/knowledge/template.yaml --stack-name ${PREFIX}-knowledge --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --parameter-overrides Prefix=${PREFIX} --tags Project=${PREFIX} --no-fail-on-empty-changeset
+          aws cloudformation deploy --template-file infra/knowledge/template.yaml --stack-name ${PREFIX}-knowledge --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Prefix=${PREFIX} --tags Project=${PREFIX} --no-fail-on-empty-changeset
 
       # Bucket CONTENTS are not resources, so the corpus is synced rather than
       # declared.
@@ -277,7 +277,7 @@ jobs:
 
       - name: deploy
         run: |
-          aws cloudformation deploy --template-file infra/agent/template.yaml --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --parameter-overrides Prefix=${PREFIX} ContainerUri="${{ steps.image.outputs.uri }}" --tags Project=${PREFIX} --no-fail-on-empty-changeset
+          aws cloudformation deploy --template-file infra/agent/template.yaml --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Prefix=${PREFIX} ContainerUri="${{ steps.image.outputs.uri }}" --tags Project=${PREFIX} --no-fail-on-empty-changeset
 
       - name: report
         run: |
