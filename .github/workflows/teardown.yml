@@ -88,6 +88,13 @@ jobs:
             if [ -z "$b" ] || [ "$b" = "None" ]; then
               echo "no output for $key"; exit 1
             fi
+            # A partially-failed teardown can leave the stack standing with
+            # some of its buckets already gone. That is a re-run, not an
+            # error - but a bucket that exists and will not empty still is.
+            if ! aws s3api head-bucket --bucket "$b" >/dev/null 2>&1; then
+              echo "$b already gone"
+              continue
+            fi
             echo "emptying $b"
             # No `|| true`. If this cannot empty the bucket, the stack delete
             # will fail anyway - better to say so here, loudly, than to fail

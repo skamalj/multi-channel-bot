@@ -349,6 +349,20 @@ Resources:
                 Action:
                   - tag:GetResources
                 Resource: '*'
+              # Read-only, and only so teardown can prove it did NOT delete
+              # the pre-existing default namespace and workgroup. The guard
+              # is worthless if the role cannot see what it is guarding.
+              - Sid: TeardownOutOfScopeCheck
+                Effect: Allow
+                Action:
+                  - redshift-serverless:ListNamespaces
+                  - redshift-serverless:ListWorkgroups
+                Resource: '*'
+              - Sid: HeadBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: '*'
       Tags:
         - { Key: Project, Value: !Ref Prefix }
 
