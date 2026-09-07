@@ -8,6 +8,13 @@ on:
         description: 'Type DESTROY to confirm. Anything else aborts.'
         required: true
         default: ''
+  # Callable, so the full-cycle workflow can prove deploy and undeploy in one
+  # run. The confirmation is still required - the caller has to pass it.
+  workflow_call:
+    inputs:
+      confirm:
+        type: string
+        required: true
 
 permissions:
   id-token: write

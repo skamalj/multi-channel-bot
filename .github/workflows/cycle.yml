@@ -1,0 +1,123 @@
+name: cycle
+
+# Deploy the whole stack, prove it is there, tear it all down, prove it is
+# gone - in one run.
+#
+# This is the test that matters before any application work. A deployment you
+# have only ever created is half a deployment: the failure modes live in the
+# delete path (a bucket with objects in it, a final snapshot that outlives the
+# stack, a Lambda ENI that takes twenty minutes to detach), and none of them
+# show up while you are only ever going forwards.
+#
+# Manual only, and it destroys what it builds - so it must never be wired to
+# a push.
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: 'Deploy and verify, then STOP without tearing down (yes/no)'
+        required: false
+        default: 'no'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  PREFIX: mcb
+
+jobs:
+
+  # -------------------------------------------------------------- 1. deploy
+  deploy:
+    name: deploy everything
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+
+  # -------------------------------------------------------------- 2. verify
+  verify:
+    name: verify it is really there
+    runs-on: ubuntu-24.04
+    environment: production
+    needs: deploy
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-verify-${{ github.run_id }}
+
+      # Assert on the resources, not on the fact that five jobs went green.
+      # A stack can report CREATE_COMPLETE while holding nothing useful.
+      - name: every stack is complete
+        run: |
+          fail=0
+          for s in foundation data knowledge tools agent; do
+            st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-${s} --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo MISSING)
+            printf '%-22s %s\n' "${PREFIX}-${s}" "$st"
+            case "$st" in
+              CREATE_COMPLETE|UPDATE_COMPLETE) ;;
+              *) fail=1 ;;
+            esac
+          done
+          exit $fail
+
+      - name: the agent runtime is READY
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query "Stacks[0].Outputs[?OutputKey=='RuntimeStatus'].OutputValue" --output text)
+          echo "runtime status: $st"
+          [ "$st" = "READY" ] || { echo "runtime is not READY"; exit 1; }
+
+      # The point of the whole build: an AG-UI turn, streamed back as events.
+      - name: invoke the agent over AG-UI
+        run: |
+          ARN=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query "Stacks[0].Outputs[?OutputKey=='AgentRuntimeArn'].OutputValue" --output text)
+          # runtimeSessionId has a 33-character minimum, and our user ids are
+          # shorter - so it is derived rather than reused.
+          SESSION=$(printf 'cycle-%s' "${GITHUB_RUN_ID}" | sha256sum | cut -c1-40)
+          cat > payload.json <<'JSON'
+          {"threadId":"cycle-probe","runId":"r1","messages":[{"id":"m1","role":"user","content":"hello"}],"state":{},"tools":[],"context":[],"forwardedProps":{}}
+          JSON
+          aws bedrock-agentcore invoke-agent-runtime --agent-runtime-arn "$ARN" --runtime-session-id "$SESSION" --qualifier live --payload fileb://payload.json --cli-read-timeout 120 events.txt
+          echo "--- events ---"; cat events.txt
+          grep -q 'RUN_STARTED'  events.txt || { echo "no RUN_STARTED";  exit 1; }
+          grep -q 'RUN_FINISHED' events.txt || { echo "no RUN_FINISHED"; exit 1; }
+          echo "AG-UI turn completed"
+
+      - name: the knowledge base answers a retrieval
+        run: |
+          KB=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-knowledge --query "Stacks[0].Outputs[?OutputKey=='KnowledgeBaseId'].OutputValue" --output text)
+          aws bedrock-agent-runtime retrieve --knowledge-base-id "$KB" --retrieval-query '{"text":"what does the health policy cover"}' --retrieval-configuration '{"vectorSearchConfiguration":{"numberOfResults":5}}' --query 'retrievalResults[].location.s3Location.uri' --output text | head -5
+
+  # ------------------------------------------------------------ 3. teardown
+  teardown:
+    name: tear it all down
+    needs: verify
+    if: inputs.keep != 'yes'
+    uses: ./.github/workflows/teardown.yml
+    with:
+      confirm: DESTROY
+    secrets: inherit
+
+  # -------------------------------------------------------------- 4. report
+  report:
+    name: cycle result
+    runs-on: ubuntu-24.04
+    needs: [deploy, verify, teardown]
+    if: always()
+    steps:
+      - name: summarise
+        run: |
+          {
+            echo "## Deploy / undeploy cycle"
+            echo
+            echo "| phase | result |"
+            echo "| --- | --- |"
+            echo "| deploy   | ${{ needs.deploy.result }} |"
+            echo "| verify   | ${{ needs.verify.result }} |"
+            echo "| teardown | ${{ needs.teardown.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ needs.deploy.result }}" = "success" ] || exit 1
+          [ "${{ needs.verify.result }}" = "success" ] || exit 1
+          [ "${{ needs.teardown.result }}" = "success" ] || [ "${{ needs.teardown.result }}" = "skipped" ] || exit 1

@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcb-agent - the agent on AgentCore Runtime, spoken to over AG-UI.
+  Highest-churn stack: it changes on every commit, which is why the slow
+  resources live elsewhere.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  ContainerUri:
+    Type: String
+    Description: ECR image URI including the tag, pushed by the deploy workflow.
+  ModelId:
+    Type: String
+    Default: moonshotai.kimi-k2.5
+  SmallModelId:
+    Type: String
+    Default: apac.amazon.nova-lite-v1:0
+  IdleSessionTimeoutSeconds:
+    Type: Number
+    Default: 300
+    Description: >
+      Runtime MEMORY is billed for every second a session is alive, idle
+      included - only CPU stops during I/O wait. The platform default is 900;
+      300 is chosen so an abandoned conversation stops costing sooner.
+  MaxLifetimeSeconds:
+    Type: Number
+    Default: 3600
+
+Resources:
+
+  # Assumed by AgentCore itself, so written by hand.
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-agent-runtime"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PullImage
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+              - Sid: Telemetry
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              # Inference. Scoped to the two models this build uses plus the
+              # inference profiles that front them - a wildcard here would let
+              # a prompt-injected agent reach any model in the account.
+              - Sid: Inference
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Sid: Retrieve
+                Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+              # The two checkpointers and the two long-term stores. Named, not
+              # wildcarded: this role has no business in any other table.
+              - Sid: Checkpoints
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-checkpoints"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-resolver"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-profiles"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-audit"
+              # Documents are written here and referenced by metadata only;
+              # their bytes never enter a checkpoint.
+              - Sid: Documents
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-documents-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-documents-${AWS::AccountId}/*"
+              # The Cognito client secret used to mint the Gateway JWT.
+              - Sid: GatewayCredentials
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Prefix}/gateway/*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  Runtime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # The name pattern is [a-zA-Z][a-zA-Z0-9_]{0,47} - underscores, NOT the
+      # hyphens every other resource here uses.
+      AgentRuntimeName: !Sub
+        - "${p}_agent"
+        - p: !Join ['_', !Split ['-', !Ref Prefix]]
+      Description: Protec multi-channel bot, AG-UI over AgentCore Runtime.
+      RoleArn: !GetAtt RuntimeRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ContainerUri
+      # The decision from the plan: the console talks AG-UI, so the process
+      # streams and the answer is emitted once the guardrail has passed it.
+      ProtocolConfiguration: AGUI
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: !Ref IdleSessionTimeoutSeconds
+        MaxLifetime: !Ref MaxLifetimeSeconds
+      EnvironmentVariables:
+        AWS_REGION_NAME: !Ref AWS::Region
+        BEDROCK_MODEL_ID: !Ref ModelId
+        BEDROCK_SMALL_MODEL_ID: !Ref SmallModelId
+        DDB_CHECKPOINT_TABLE: !Sub "${Prefix}-checkpoints"
+        DDB_RESOLVER_TABLE: !Sub "${Prefix}-resolver"
+        DDB_PROFILE_TABLE: !Sub "${Prefix}-profiles"
+        DDB_AUDIT_TABLE: !Sub "${Prefix}-audit"
+        S3_BUCKET: !Sub "${Prefix}-documents-${AWS::AccountId}"
+        SSM_PREFIX: !Sub "/${Prefix}"
+      Tags:
+        Project: !Ref Prefix
+
+  # A named endpoint so the console has a stable address to invoke, rather
+  # than depending on whatever version was deployed last.
+  RuntimeEndpoint:
+    Type: AWS::BedrockAgentCore::RuntimeEndpoint
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: live
+      AgentRuntimeId: !GetAtt Runtime.AgentRuntimeId
+      Description: The endpoint the console invokes.
+
+Outputs:
+  AgentRuntimeArn:
+    Value: !GetAtt Runtime.AgentRuntimeArn
+    Export: { Name: !Sub "${Prefix}-agent-runtime-arn" }
+  AgentRuntimeId:
+    Value: !GetAtt Runtime.AgentRuntimeId
+    Export: { Name: !Sub "${Prefix}-agent-runtime-id" }
+  AgentRuntimeVersion:
+    Value: !GetAtt Runtime.AgentRuntimeVersion
+  RuntimeStatus:
+    Value: !GetAtt Runtime.Status

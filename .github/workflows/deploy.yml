@@ -1,21 +1,18 @@
 name: deploy
 
-# Push to main, or run by hand. A fork cannot push to main, so a fork cannot
-# reach AWS through this workflow.
+# Push to main, run by hand, or called by the full-cycle workflow. A fork
+# cannot push to main, so a fork cannot reach AWS through this.
 on:
   push:
     branches: [main]
     paths:
       - 'infra/**'
+      - 'agent/**'
       - 'app/**'
       - 'scripts/**'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
-    inputs:
-      stacks:
-        description: 'Which stacks to deploy (all | foundation | data)'
-        required: false
-        default: all
+  workflow_call:
 
 permissions:
   id-token: write       # the OIDC token; this is what makes the role work
@@ -31,137 +28,257 @@ env:
 
 jobs:
 
+  # ------------------------------------------------------------- foundation
   foundation:
-    name: mcb-foundation
+    name: 1 foundation
     runs-on: ubuntu-24.04
     environment: production
-    if: >-
-      github.event_name == 'push' ||
-      contains(fromJSON('["all","foundation"]'), inputs.stacks)
+    outputs:
+      repo_uri: ${{ steps.out.outputs.repo_uri }}
     steps:
       - uses: actions/checkout@v4
-
-      # Prints the OIDC subject so a trust-policy mismatch is a fact rather
-      # than a guess. The claim is not a secret; the token it comes from is
-      # never printed.
-      - name: show oidc subject
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const tok = await core.getIDToken('sts.amazonaws.com')
-            const c = JSON.parse(Buffer.from(tok.split('.')[1], 'base64').toString())
-            core.info('sub = ' + c.sub)
-            core.info('aud = ' + c.aud)
-            core.info('repository = ' + c.repository)
-
-      - name: assume deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-foundation-${{ github.run_id }}
 
       # Every deploy passes --role-arn. CloudFormation does the creating, not
-      # this workflow: the deploy role can drive CloudFormation and pass
-      # exactly one role, and cannot create a resource directly.
+      # this workflow: the deploy role drives CloudFormation and can pass
+      # exactly one role, so a compromised workflow cannot mint itself another.
       - name: deploy
         run: |
-          aws cloudformation deploy \
-            --template-file infra/foundation/template.yaml \
-            --stack-name ${PREFIX}-foundation \
-            --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} \
-            --parameter-overrides Prefix=${PREFIX} \
-            --tags Project=${PREFIX} \
-            --no-fail-on-empty-changeset
+          aws cloudformation deploy --template-file infra/foundation/template.yaml --stack-name ${PREFIX}-foundation --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --parameter-overrides Prefix=${PREFIX} --tags Project=${PREFIX} --no-fail-on-empty-changeset
 
-      - name: report
+      - name: outputs
+        id: out
         run: |
-          aws cloudformation describe-stacks \
-            --stack-name ${PREFIX}-foundation \
-            --query 'Stacks[0].Outputs' --output table
+          uri=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation --query "Stacks[0].Outputs[?OutputKey=='AgentRepositoryUri'].OutputValue" --output text)
+          echo "repo_uri=$uri" >> "$GITHUB_OUTPUT"
+          echo "ECR: $uri"
 
+  # ------------------------------------------------------------------- data
   data:
-    name: mcb-data
+    name: 2 data
     runs-on: ubuntu-24.04
     environment: production
     needs: foundation
-    if: >-
-      always() && needs.foundation.result != 'failure' && (
-        github.event_name == 'push' ||
-        contains(fromJSON('["all","data"]'), inputs.stacks))
+    outputs:
+      host: ${{ steps.out.outputs.host }}
+      subnets: ${{ steps.out.outputs.subnets }}
+      sg: ${{ steps.out.outputs.sg }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: install SAM
-        run: pip install --quiet aws-sam-cli
-
-      - name: assume deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+        with: { python-version: '3.12' }
+      - run: pip install --quiet aws-sam-cli
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-data-${{ github.run_id }}
 
-      # This is the whole reason the build happens here rather than on a
-      # laptop: `sam build` on Windows resolves Windows wheels for psycopg,
-      # and the fix that normally applies (--use-container) needs Docker.
-      # On a Linux runner the wheels are simply correct.
-      # A stack whose first CREATE failed sits in ROLLBACK_COMPLETE, and
-      # CloudFormation will not update it - it can only be deleted. Left
-      # alone, a single bad deploy blocks every deploy after it.
+      # A stack whose first CREATE failed sits in ROLLBACK_COMPLETE and cannot
+      # be updated - only deleted. Left alone, one bad deploy blocks every
+      # deploy after it.
       - name: clear a failed first create
         run: |
-          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-data                  --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-data --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
           echo "mcb-data is $st"
           if [ "$st" = "ROLLBACK_COMPLETE" ]; then
-            echo "deleting the failed create so this deploy can proceed"
-            aws cloudformation delete-stack --stack-name ${PREFIX}-data               --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation delete-stack --stack-name ${PREFIX}-data --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
             aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-data
           fi
 
+      # This is why the build happens here and not on a laptop: `sam build` on
+      # Windows resolves Windows wheels for psycopg2, and the usual remedy
+      # (--use-container) needs Docker. On a Linux runner they are just right.
       - name: sam build
         run: sam build --template infra/data/template.yaml --build-dir .aws-sam/data
 
-      # Parameter Store is the store of record for the password. It is read
-      # here and passed as a NoEcho override, because the migrate Lambda sits
-      # in a VPC with no NAT and cannot reach the SSM API itself.
+      # Parameter Store is the store of record. It is read here and passed as
+      # a NoEcho override, because the migrate Lambda sits in a VPC with no
+      # NAT and cannot reach the SSM API itself.
       - name: read redshift password
         id: pw
         run: |
-          PW=$(aws ssm get-parameter --name "/${PREFIX}/redshift/admin-password" \
-                 --with-decryption --query 'Parameter.Value' --output text)
+          PW=$(aws ssm get-parameter --name "/${PREFIX}/redshift/admin-password" --with-decryption --query 'Parameter.Value' --output text)
           echo "::add-mask::$PW"
           echo "value=$PW" >> "$GITHUB_OUTPUT"
 
       - name: sam deploy
         run: |
-          sam deploy \
-            --template-file .aws-sam/data/template.yaml \
-            --stack-name ${PREFIX}-data \
-            --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} \
-            --s3-bucket ${{ vars.AWS_ARTIFACTS_BUCKET }} \
-            --s3-prefix ${PREFIX}-data \
-            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --tags Project=${PREFIX} \
-            --parameter-overrides \
-              Prefix=${PREFIX} \
-              AdminPassword='${{ steps.pw.outputs.value }}'
+          sam deploy --template-file .aws-sam/data/template.yaml --stack-name ${PREFIX}-data --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --s3-bucket ${{ vars.AWS_ARTIFACTS_BUCKET }} --s3-prefix ${PREFIX}-data --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset --tags Project=${PREFIX} --parameter-overrides Prefix=${PREFIX} AdminPassword="${{ steps.pw.outputs.value }}"
 
-      # The imperative half: schema and seed are DDL, not resources. The
-      # function is idempotent, so running it on every deploy is safe.
+      # Schema and seed are DDL, not resources. Idempotent, so running it on
+      # every deploy is safe.
       - name: run migrations
         run: |
-          aws lambda invoke \
-            --function-name ${PREFIX}-migrate \
-            --cli-binary-format raw-in-base64-out \
-            --payload '{}' \
-            --cli-read-timeout 600 \
-            response.json
+          aws lambda invoke --function-name ${PREFIX}-migrate --cli-binary-format raw-in-base64-out --payload '{}' --cli-read-timeout 600 response.json
           cat response.json
           grep -q '"ok": *true' response.json
+
+      - name: outputs
+        id: out
+        run: |
+          q() { aws cloudformation describe-stacks --stack-name ${PREFIX}-data --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          echo "host=$(q RedshiftHost)" >> "$GITHUB_OUTPUT"
+          echo "subnets=$(q SubnetIds)" >> "$GITHUB_OUTPUT"
+          echo "sg=$(q SecurityGroupId)" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------- knowledge
+  knowledge:
+    name: 3 knowledge
+    runs-on: ubuntu-24.04
+    environment: production
+    needs: foundation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-knowledge-${{ github.run_id }}
+
+      - name: deploy
+        run: |
+          aws cloudformation deploy --template-file infra/knowledge/template.yaml --stack-name ${PREFIX}-knowledge --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --parameter-overrides Prefix=${PREFIX} --tags Project=${PREFIX} --no-fail-on-empty-changeset
+
+      # Bucket CONTENTS are not resources, so the corpus is synced rather than
+      # declared.
+      - name: build and sync corpus
+        env:
+          NO_AWS: '1'
+          MOCK_LLM: '1'
+        run: |
+          uv sync --group dev
+          uv run python scripts/build_corpus.py
+          BUCKET=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation --query "Stacks[0].Outputs[?OutputKey=='CorpusBucketName'].OutputValue" --output text)
+          aws s3 sync data/generated/corpus "s3://$BUCKET/corpus/" --delete --only-show-errors
+          aws s3 ls "s3://$BUCKET/corpus/" --recursive --summarize | tail -3
+
+      # CloudFormation creates the data source; running the job is work.
+      - name: start ingestion
+        run: |
+          KB=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-knowledge --query "Stacks[0].Outputs[?OutputKey=='KnowledgeBaseId'].OutputValue" --output text)
+          DS=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-knowledge --query "Stacks[0].Outputs[?OutputKey=='DataSourceId'].OutputValue" --output text)
+          JOB=$(aws bedrock-agent start-ingestion-job --knowledge-base-id "$KB" --data-source-id "$DS" --query 'ingestionJob.ingestionJobId' --output text)
+          echo "ingestion job $JOB"
+          for i in $(seq 1 60); do
+            S=$(aws bedrock-agent get-ingestion-job --knowledge-base-id "$KB" --data-source-id "$DS" --ingestion-job-id "$JOB" --query 'ingestionJob.status' --output text)
+            echo "  $S"
+            case "$S" in
+              COMPLETE) exit 0 ;;
+              FAILED) aws bedrock-agent get-ingestion-job --knowledge-base-id "$KB" --data-source-id "$DS" --ingestion-job-id "$JOB"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "ingestion did not finish in 10 minutes"; exit 1
+
+  # ------------------------------------------------------------------ tools
+  tools:
+    name: 4 tools
+    runs-on: ubuntu-24.04
+    environment: production
+    needs: [foundation, data]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: pip install --quiet aws-sam-cli
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tools-${{ github.run_id }}
+
+      # Generated from the registry, which already resolves each tool's real
+      # argument types. Writing 27 definitions by hand would be a second,
+      # worse copy of that knowledge, and it would drift.
+      - name: generate tool definitions
+        env:
+          NO_AWS: '1'
+          MOCK_LLM: '1'
+        run: |
+          uv sync --group dev
+          uv run python scripts/gen_tool_definitions.py --out tool-definitions.json
+          aws s3 cp tool-definitions.json "s3://${{ vars.AWS_ARTIFACTS_BUCKET }}/tools/tool-definitions.json"
+
+      - name: clear a failed first create
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-tools --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          if [ "$st" = "ROLLBACK_COMPLETE" ]; then
+            aws cloudformation delete-stack --stack-name ${PREFIX}-tools --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-tools
+          fi
+
+      - name: sam build
+        run: sam build --template infra/tools/template.yaml --build-dir .aws-sam/tools
+
+      - name: read redshift password
+        id: pw
+        run: |
+          PW=$(aws ssm get-parameter --name "/${PREFIX}/redshift/admin-password" --with-decryption --query 'Parameter.Value' --output text)
+          echo "::add-mask::$PW"
+          echo "value=$PW" >> "$GITHUB_OUTPUT"
+
+      - name: sam deploy
+        run: |
+          sam deploy --template-file .aws-sam/tools/template.yaml --stack-name ${PREFIX}-tools --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --s3-bucket ${{ vars.AWS_ARTIFACTS_BUCKET }} --s3-prefix ${PREFIX}-tools --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset --tags Project=${PREFIX} --parameter-overrides Prefix=${PREFIX} ToolSchemaS3Uri="s3://${{ vars.AWS_ARTIFACTS_BUCKET }}/tools/tool-definitions.json" RedshiftHost="${{ needs.data.outputs.host }}" RedshiftPassword="${{ steps.pw.outputs.value }}" VpcSubnetIds="${{ needs.data.outputs.subnets }}" VpcSecurityGroupId="${{ needs.data.outputs.sg }}"
+
+      # Reachability, not behaviour: invoked directly with no Gateway client
+      # context, the handler answers its probe branch.
+      - name: probe the tools lambda
+        run: |
+          aws lambda invoke --function-name ${PREFIX}-tools --cli-binary-format raw-in-base64-out --payload '{}' probe.json
+          cat probe.json
+          grep -q '"probe": *true' probe.json
+
+  # ------------------------------------------------------------------ agent
+  agent:
+    name: 5 agent
+    # Native ARM64. AgentCore Runtime requires a Graviton image, and these
+    # runners are free on a public repository - no QEMU, no cross-build.
+    runs-on: ubuntu-24.04-arm
+    environment: production
+    needs: [foundation, tools]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-agent-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: build and push arm64 image
+        id: image
+        run: |
+          REPO="${{ needs.foundation.outputs.repo_uri }}"
+          TAG="${GITHUB_SHA::12}"
+          docker build --platform linux/arm64 -t "$REPO:$TAG" -t "$REPO:latest" agent/
+          docker push "$REPO:$TAG"
+          docker push "$REPO:latest"
+          echo "uri=$REPO:$TAG" >> "$GITHUB_OUTPUT"
+          docker image inspect "$REPO:$TAG" --format 'built {{.Architecture}}/{{.Os}}'
+
+      - name: clear a failed first create
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          if [ "$st" = "ROLLBACK_COMPLETE" ]; then
+            aws cloudformation delete-stack --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-agent
+          fi
+
+      - name: deploy
+        run: |
+          aws cloudformation deploy --template-file infra/agent/template.yaml --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --parameter-overrides Prefix=${PREFIX} ContainerUri="${{ steps.image.outputs.uri }}" --tags Project=${PREFIX} --no-fail-on-empty-changeset
+
+      - name: report
+        run: |
+          aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query 'Stacks[0].Outputs' --output table

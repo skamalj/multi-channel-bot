@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  mcb-tools - the 27 tools behind one Lambda, fronted by an AgentCore Gateway
+  with inbound JWT auth (D-1) and outbound IAM.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  ToolSchemaS3Uri:
+    Type: String
+    Description: >
+      s3://.../tool-definitions.json, generated from the tool registry at build
+      time by scripts/gen_tool_definitions.py. Generated rather than written:
+      the registry already knows every tool's real argument types.
+  RedshiftHost:
+    Type: String
+    Default: ''
+    Description: Empty until mcb-data exists; the tools run stubbed without it.
+  RedshiftPort:
+    Type: String
+    Default: '5439'
+  RedshiftDb:
+    Type: String
+    Default: mcb
+  RedshiftUser:
+    Type: String
+    Default: mcbadmin
+  RedshiftPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+  VpcSecurityGroupId:
+    Type: String
+    Default: ''
+
+Conditions:
+  # The tools Lambda only joins the VPC once there is a Redshift to reach.
+  # Before that it deploys and answers, which is what lets the deploy/teardown
+  # cycle be proven independently of the data layer.
+  InVpc: !Not [!Equals [!Ref VpcSecurityGroupId, '']]
+
+Resources:
+
+  # -------------------------------------------------------- JWT issuer (D-1)
+  # AgentCore Gateway validates an inbound JWT against an OIDC discovery
+  # document. Cognito is the issuer: a machine-to-machine app client using the
+  # client_credentials grant, which is the right shape for an agent calling a
+  # tool server - there is no human in this exchange to authorise anything.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      UserPoolName: !Sub "${Prefix}-tools"
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      UserPoolTags:
+        Project: !Ref Prefix
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Account-scoped so two deployments of this stack in one account do not
+      # collide on a globally unique domain name.
+      Domain: !Sub "${Prefix}-tools-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+  # Scopes exist so the token says what it is for. The Gateway is told to
+  # accept only this one.
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub "${Prefix}-tools"
+      Name: !Sub "${Prefix} tools"
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Call the Protec tool server
+
+  AgentClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: !Sub "${Prefix}-agent"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${Prefix}-tools/invoke"
+      SupportedIdentityProviders: [COGNITO]
+      # No user-facing flows at all. This client cannot log a person in.
+      ExplicitAuthFlows: []
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      TokenValidityUnits: { AccessToken: minutes }
+
+  # ------------------------------------------------------------ tools Lambda
+  # No hand-written execution role - SAM generates it from Policies.
+  ToolsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-tools"
+      CodeUri: handler/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 60
+      MemorySize: 1024
+      VpcConfig: !If
+        - InVpc
+        - SecurityGroupIds: [!Ref VpcSecurityGroupId]
+          SubnetIds: !Ref VpcSubnetIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          REDSHIFT_HOST: !Ref RedshiftHost
+          REDSHIFT_PORT: !Ref RedshiftPort
+          REDSHIFT_DB: !Ref RedshiftDb
+          REDSHIFT_USER: !Ref RedshiftUser
+          REDSHIFT_PASSWORD: !Ref RedshiftPassword
+          DOCUMENTS_BUCKET: !Sub "${Prefix}-documents-${AWS::AccountId}"
+      Policies:
+        - !If
+          - InVpc
+          - VPCAccessPolicy: {}
+          - !Ref AWS::NoValue
+        - S3ReadPolicy:
+            BucketName: !Sub "${Prefix}-documents-${AWS::AccountId}"
+      Tags:
+        Project: !Ref Prefix
+
+  ToolsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-tools"
+      RetentionInDays: 7
+
+  # ----------------------------------------------------------------- Gateway
+  # Assumed by AgentCore, so it is written by hand. It can invoke exactly one
+  # function and do nothing else - the narrowest role in the account.
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}-gateway"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-tools
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ToolsFunction.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${Prefix}-artifacts-${AWS::AccountId}/*"
+      Tags:
+        - { Key: Project, Value: !Ref Prefix }
+
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${Prefix}-tools"
+      Description: Protec tool server. 27 tools, one Lambda.
+      RoleArn: !GetAtt GatewayRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+          AllowedClients: [!Ref AgentClient]
+      Tags:
+        Project: !Ref Prefix
+
+  ToolsTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${Prefix}core"
+      Description: Every registered tool, dispatched inside one function.
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ToolsFunction.Arn
+            ToolSchema:
+              # From S3, not inline: 27 tool definitions with real JSON Schema
+              # would dominate the template, and the file is generated.
+              S3:
+                Uri: !Ref ToolSchemaS3Uri
+                BucketOwnerAccountId: !Ref AWS::AccountId
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # The agent mints its own Gateway token with the client_credentials grant,
+  # so it needs the client secret. It goes to Parameter Store as a plain
+  # String because CloudFormation cannot create a SecureString - an accepted
+  # demo trade-off, made explicit rather than hidden. The runtime role is the
+  # only principal granted ssm:GetParameter on this path.
+  GatewayClientSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Prefix}/gateway/client-secret"
+      Type: String
+      Value: !GetAtt AgentClient.ClientSecret
+      Description: Cognito client secret for the agent to call the Gateway.
+      Tags:
+        Project: !Ref Prefix
+
+  GatewayClientId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Prefix}/gateway/client-id"
+      Type: String
+      Value: !Ref AgentClient
+      Tags:
+        Project: !Ref Prefix
+
+  GatewayEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Prefix}/gateway/url"
+      Type: String
+      Value: !GetAtt Gateway.GatewayUrl
+      Tags:
+        Project: !Ref Prefix
+
+  GatewayTokenEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Prefix}/gateway/token-endpoint"
+      Type: String
+      Value: !Sub "https://${Prefix}-tools-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+      Tags:
+        Project: !Ref Prefix
+
+Outputs:
+  GatewayUrl:
+    Value: !GetAtt Gateway.GatewayUrl
+    Export: { Name: !Sub "${Prefix}-gateway-url" }
+  GatewayId:
+    Value: !GetAtt Gateway.GatewayIdentifier
+    Export: { Name: !Sub "${Prefix}-gateway-id" }
+  ToolsFunctionArn:
+    Value: !GetAtt ToolsFunction.Arn
+    Export: { Name: !Sub "${Prefix}-tools-function-arn" }
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: { Name: !Sub "${Prefix}-user-pool-id" }
+  AgentClientId:
+    Value: !Ref AgentClient
+    Export: { Name: !Sub "${Prefix}-agent-client-id" }
+  TokenEndpoint:
+    Value: !Sub "https://${Prefix}-tools-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+    Export: { Name: !Sub "${Prefix}-token-endpoint" }
+  TokenScope:
+    Value: !Sub "${Prefix}-tools/invoke"
+    Export: { Name: !Sub "${Prefix}-token-scope" }
