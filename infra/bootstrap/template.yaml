@@ -314,14 +314,25 @@ Resources:
                 Resource: '*'
               # Teardown has to be able to empty buckets before the stack that
               # owns them can be deleted.
+              # Emptying a bucket needs ListBucket on the BUCKET and
+              # DeleteObject on its CONTENTS - two different ARN shapes. The
+              # bucket-level grant was missing, so `aws s3 rm --recursive`
+              # had nothing to enumerate.
               - Sid: TeardownEmptyBuckets
                 Effect: Allow
                 Action:
                   - s3:DeleteObject
                   - s3:DeleteObjectVersion
-                  - s3:ListBucketVersions
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-*/*"
+              - Sid: TeardownListBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-*"
               # The Redshift password lives in Parameter Store and is read
               # here at deploy time, then passed to CloudFormation as a
               # NoEcho override. It is never in the repository, and the

@@ -69,16 +69,33 @@ jobs:
       # fails with `409 ... not empty`, and ONLY the buckets fail. DynamoDB
       # tables and the ECR repository (EmptyOnDelete) clean themselves up.
       #
-      # The artifacts bucket is skipped: it belongs to mcb-bootstrap, which
-      # this workflow deliberately does not touch.
+      # The bucket names are read from the stack that owns them rather than
+      # discovered with `s3api list-buckets`. Enumerating needs
+      # s3:ListAllMyBuckets, which the deploy role does not have and should
+      # not need - and when that call was denied the loop simply ran zero
+      # times and emptied nothing, silently, until the stack delete failed
+      # twenty-five minutes later.
       - name: empty application buckets
         run: |
-          for b in $(aws s3api list-buckets --query "Buckets[?starts_with(Name,'${PREFIX}-')].Name" --output text); do
-            case "$b" in
-              ${PREFIX}-artifacts-*) echo "skip $b (bootstrap-owned)"; continue ;;
-            esac
+          set -o pipefail
+          if ! aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation >/dev/null 2>&1; then
+            echo "mcb-foundation absent; no buckets to empty"
+            exit 0
+          fi
+          out() { aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          for key in CorpusBucketName DocumentsBucketName; do
+            b=$(out "$key")
+            if [ -z "$b" ] || [ "$b" = "None" ]; then
+              echo "no output for $key"; exit 1
+            fi
             echo "emptying $b"
-            aws s3 rm "s3://$b" --recursive --only-show-errors || true
+            # No `|| true`. If this cannot empty the bucket, the stack delete
+            # will fail anyway - better to say so here, loudly, than to fail
+            # opaquely much later.
+            aws s3 rm "s3://$b" --recursive --only-show-errors
+            left=$(aws s3 ls "s3://$b" --recursive | wc -l)
+            echo "  $left objects remain"
+            [ "$left" -eq 0 ] || { echo "could not empty $b"; exit 1; }
           done
 
       # Reverse of creation order. A stack that does not exist is not an
