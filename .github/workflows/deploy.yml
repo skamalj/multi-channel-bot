@@ -142,6 +142,18 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-knowledge-${{ github.run_id }}
 
+      # Knowledge needs this as much as the others do - it was the one job
+      # without it, so a stack left in ROLLBACK_COMPLETE by an earlier bug
+      # kept failing with that bug's error long after the fix was in.
+      - name: clear a failed first create
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-knowledge --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          echo "mcb-knowledge is $st"
+          if [ "$st" = "ROLLBACK_COMPLETE" ]; then
+            aws cloudformation delete-stack --stack-name ${PREFIX}-knowledge --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-knowledge
+          fi
+
       - name: deploy
         run: |
           aws cloudformation deploy --template-file infra/knowledge/template.yaml --stack-name ${PREFIX}-knowledge --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Prefix=${PREFIX} --tags Project=${PREFIX} --no-fail-on-empty-changeset
