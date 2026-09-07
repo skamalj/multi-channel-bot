@@ -42,19 +42,21 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-teardown-${{ github.run_id }}
 
-      # This account has Redshift Serverless resources that predate the
+      # This account holds Redshift Serverless resources that predate the
       # project and belong to no stack: `default-namespace` and
       # `default-workgroup`. They are OUT OF SCOPE and must survive every
-      # teardown. Recorded before, checked after - so a regression that
-      # started deleting them would fail the job rather than pass quietly.
+      # teardown.
+      #
+      # They are already safe by construction - teardown deletes named mcb-*
+      # stacks, and these are in none of them - but "safe by construction" is
+      # an assumption until something checks it. Recorded here, compared at
+      # the end.
       - name: record out-of-scope resources
         run: |
-          aws redshift-serverless list-namespaces             --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName'             --output text | tr '	' '
-' | sort > /tmp/ns-before.txt
-          aws redshift-serverless list-workgroups             --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName'             --output text | tr '	' '
-' | sort > /tmp/wg-before.txt
+          aws redshift-serverless list-namespaces --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName' --output text | xargs -n1 | sort > /tmp/ns-before.txt
+          aws redshift-serverless list-workgroups --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName' --output text | xargs -n1 | sort > /tmp/wg-before.txt
           echo "namespaces that must survive:"; cat /tmp/ns-before.txt
-          echo "workgroups that must survive:";  cat /tmp/wg-before.txt
+          echo "workgroups that must survive:"; cat /tmp/wg-before.txt
 
       # Proven necessary, not assumed: a delete with objects in the buckets
       # fails with `409 ... not empty`, and ONLY the buckets fail. DynamoDB
@@ -64,9 +66,7 @@ jobs:
       # this workflow deliberately does not touch.
       - name: empty application buckets
         run: |
-          for b in $(aws s3api list-buckets \
-                       --query "Buckets[?starts_with(Name,'${PREFIX}-')].Name" \
-                       --output text); do
+          for b in $(aws s3api list-buckets --query "Buckets[?starts_with(Name,'${PREFIX}-')].Name" --output text); do
             case "$b" in
               ${PREFIX}-artifacts-*) echo "skip $b (bootstrap-owned)"; continue ;;
             esac
@@ -82,15 +82,12 @@ jobs:
             name="${PREFIX}-${s}"
             if aws cloudformation describe-stacks --stack-name "$name" >/dev/null 2>&1; then
               echo "::group::deleting $name"
-              aws cloudformation delete-stack --stack-name "$name" \
-                --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
-              aws cloudformation wait stack-delete-complete --stack-name "$name" || {
+              aws cloudformation delete-stack --stack-name "$name" --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+              if ! aws cloudformation wait stack-delete-complete --stack-name "$name"; then
                 echo "delete failed for $name; reasons:"
-                aws cloudformation describe-stack-events --stack-name "$name" \
-                  --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
-                  --output text
+                aws cloudformation describe-stack-events --stack-name "$name" --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" --output text
                 exit 1
-              }
+              fi
               echo "::endgroup::"
             else
               echo "$name absent, nothing to do"
@@ -101,34 +98,29 @@ jobs:
       # artifacts bucket are SUPPOSED to survive - they are what this workflow
       # authenticated with. Without excluding them the check would fail on
       # every successful teardown, which is an alarm nobody would keep.
-      - name: verify nothing survives
+      - name: verify nothing of ours survives
         run: |
-          survivors=$(aws resourcegroupstaggingapi get-resources \
-            --tag-filters "Key=Project,Values=${PREFIX}" \
-            --query 'ResourceTagMappingList[].ResourceARN' --output text \
-            | tr '\t' '\n' \
-            | grep -v ":stack/${PREFIX}-bootstrap/" \
-            | grep -v ":::${PREFIX}-artifacts-" \
-            | sed '/^$/d' || true)
-          if [ -n "$survivors" ]; then
+          aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=${PREFIX}" --query 'ResourceTagMappingList[].ResourceARN' --output text | xargs -n1 | grep -v ":stack/${PREFIX}-bootstrap/" | grep -v ":::${PREFIX}-artifacts-" > /tmp/survivors.txt || true
+          if [ -s /tmp/survivors.txt ]; then
             echo "these resources outlived teardown:"
-            echo "$survivors"
+            cat /tmp/survivors.txt
             exit 1
           fi
           echo "clean: only mcb-bootstrap and its artifacts bucket remain, by design"
 
       # The other half of the guard. Deleting something the project does not
-      # own is a worse failure than leaving something behind, so this is
-      # checked last and fails the job loudly.
+      # own is a worse failure than leaving something behind, so this runs
+      # even when an earlier step failed.
       - name: out-of-scope resources still intact
         if: always()
         run: |
-          aws redshift-serverless list-namespaces             --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName'             --output text | tr '	' '
-' | sort > /tmp/ns-after.txt
-          aws redshift-serverless list-workgroups             --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName'             --output text | tr '	' '
-' | sort > /tmp/wg-after.txt
-          if ! diff -u /tmp/ns-before.txt /tmp/ns-after.txt             || ! diff -u /tmp/wg-before.txt /tmp/wg-after.txt; then
-            echo "TEARDOWN DELETED SOMETHING IT DOES NOT OWN"
+          aws redshift-serverless list-namespaces --query 'namespaces[?!starts_with(namespaceName, `mcb-`)].namespaceName' --output text | xargs -n1 | sort > /tmp/ns-after.txt
+          aws redshift-serverless list-workgroups --query 'workgroups[?!starts_with(workgroupName, `mcb-`)].workgroupName' --output text | xargs -n1 | sort > /tmp/wg-after.txt
+          ok=0
+          diff -u /tmp/ns-before.txt /tmp/ns-after.txt || ok=1
+          diff -u /tmp/wg-before.txt /tmp/wg-after.txt || ok=1
+          if [ "$ok" -ne 0 ]; then
+            echo "TEARDOWN TOUCHED SOMETHING IT DOES NOT OWN"
             exit 1
           fi
           echo "pre-existing Redshift namespaces and workgroups are untouched"
