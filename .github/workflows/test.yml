@@ -56,5 +56,15 @@ jobs:
 
       # Catches a bad !GetAtt or an unknown property before a stack rollback
       # spends ten minutes proving the same thing.
+      #
+      # Errors fail the build; warnings do not. Two of them are simply wrong
+      # here and would otherwise have to be silenced individually:
+      #
+      #   W3037 - "'bedrock-agent' is not a known service prefix". It is; the
+      #           list cfn-lint checks against is out of date, and the policy
+      #           using it provisions Knowledge Bases successfully.
+      #   W1030 - the empty default for VpcSubnetIds "does not match
+      #           ^subnet-...". It never reaches AWS: an Fn::If drops the
+      #           whole VpcConfig when the stack is deployed without a VPC.
       - name: lint every template
-        run: cfn-lint infra/*/template.yaml --format parseable
+        run: cfn-lint infra/*/template.yaml --format parseable --non-zero-exit-code error
