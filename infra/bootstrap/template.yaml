@@ -288,6 +288,22 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}"
                   - !Sub "arn:${AWS::Partition}:s3:::${Prefix}-corpus-${AWS::AccountId}/*"
+              # The cycle workflow proves the deployment by USING it: one
+              # real AG-UI turn and one retrieval. Both need permissions the
+              # deploy role would not otherwise have, and neither is a
+              # provisioning action - this is the verification, not the build.
+              - Sid: VerifyByUsing
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Sid: VerifyRetrieval
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
               - Sid: StartIngestion
                 Effect: Allow
                 Action:
