@@ -94,7 +94,14 @@ jobs:
   teardown:
     name: tear it all down
     needs: verify
-    if: inputs.keep != 'yes'
+    # `always()` on purpose. Teardown is one of the two things this workflow
+    # exists to prove, so it must not be gated on verify passing - a failed
+    # verify previously skipped it and left the whole stack standing, which
+    # is both the wrong outcome and the wrong bill.
+    #
+    # `keep: yes` is the only thing that stops it, and that is a deliberate
+    # human choice made at dispatch.
+    if: always() && inputs.keep != 'yes'
     uses: ./.github/workflows/teardown.yml
     with:
       confirm: DESTROY
