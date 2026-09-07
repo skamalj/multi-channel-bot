@@ -41,6 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Prints the OIDC subject so a trust-policy mismatch is a fact rather
+      # than a guess. The claim is not a secret; the token it comes from is
+      # never printed.
+      - name: show oidc subject
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tok = await core.getIDToken('sts.amazonaws.com')
+            const c = JSON.parse(Buffer.from(tok.split('.')[1], 'base64').toString())
+            core.info('sub = ' + c.sub)
+            core.info('aud = ' + c.aud)
+            core.info('repository = ' + c.repository)
+
       - name: assume deploy role
         uses: aws-actions/configure-aws-credentials@v4
         with:
