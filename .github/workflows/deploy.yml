@@ -93,6 +93,19 @@ jobs:
       # This is why the build happens here and not on a laptop: `sam build` on
       # Windows resolves Windows wheels for psycopg2, and the usual remedy
       # (--use-container) needs Docker. On a Linux runner they are just right.
+      # The reference schema and seed are GENERATED from the Python fixtures,
+      # so the database cannot drift from what the offline tests assert. If
+      # this produces a diff, the fixtures changed and the migration follows.
+      - name: generate the reference migration
+        env:
+          NO_AWS: '1'
+          MOCK_LLM: '1'
+        run: |
+          pipx install uv || pip install --quiet uv
+          uv sync --group dev
+          uv run python scripts/gen_seed_sql.py
+          git --no-pager diff --stat -- infra/data/migrate/migrations || true
+
       - name: sam build
         run: sam build --template infra/data/template.yaml --build-dir .aws-sam/data
 

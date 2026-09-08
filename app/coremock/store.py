@@ -21,6 +21,8 @@ import hashlib
 import time
 import uuid
 from collections import deque
+
+from app.coremock import backend
 from datetime import date, datetime, timedelta, timezone
 
 from app.config import settings
@@ -213,7 +215,7 @@ def _idem(key: str | None, op: str, payload: dict):
         return None
     digest = hashlib.sha256(
         repr(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
-    hit = _IDEMPOTENCY.get(f"{op}:{key}")
+    hit = backend.ledger_get(f"{op}:{key}")
     if hit is None:
         return None
     if hit["digest"] != digest:
@@ -227,35 +229,35 @@ def _remember(key: str | None, op: str, payload: dict, result: dict) -> dict:
     if key:
         digest = hashlib.sha256(
             repr(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
-        _IDEMPOTENCY[f"{op}:{key}"] = {"digest": digest, "result": result}
+        backend.ledger_put(f"{op}:{key}", op,
+                           {"digest": digest, "result": result})
     return result
 
 
 # --- directory -------------------------------------------------------------
 def customer_for(user_id: str) -> dict | None:
-    return _CUSTOMERS.get(user_id)
+    return backend.customer(user_id)
 
 
 def producer_for(user_id: str) -> dict | None:
-    return _PRODUCERS.get(user_id)
+    return backend.producer(user_id)
 
 
 def holdings_for(user_id: str) -> dict[str, bool]:
     """Facts ABOUT a line of business - which is exactly what may be shared."""
-    cust = _CUSTOMERS.get(user_id)
+    cust = backend.customer(user_id)
     if not cust:
         return {}
     held: dict[str, bool] = {}
     for pid in cust["policies"]:
-        pol = _POLICIES.get(pid)
+        pol = backend.policy(pid)
         if pol:
             held[pol["lob"]] = True
     return held
 
 
 def policies_for_customer(customer_id: str, lob: str) -> list[dict]:
-    return [p for p in _POLICIES.values()
-            if p["customer_id"] == customer_id and p["lob"] == lob]
+    return backend.policies_for(customer_id, lob)
 
 
 # --- quote interface -------------------------------------------------------
@@ -274,13 +276,13 @@ def save_quote(q: dict, idempotency_key: str | None = None) -> dict:
           "created_at": now.isoformat(),
           "valid_until": (now + timedelta(days=QUOTE_VALIDITY_DAYS)).date().isoformat(),
           "status": "rated"}
-    _QUOTES[qid] = q
+    backend.put_quote(q)
     return _remember(idempotency_key, "quote_create", payload, q)
 
 
 def get_quote(quote_id: str) -> dict:
     _latency("quote")
-    q = _QUOTES.get(quote_id)
+    q = backend.get_quote(quote_id)
     if not q:
         return {"error": "not_found", "quote_id": quote_id}
     expired = date.fromisoformat(q["valid_until"]) < datetime.now(timezone.utc).date()
@@ -292,7 +294,7 @@ def get_quote(quote_id: str) -> dict:
 # --- policy interface ------------------------------------------------------
 def get_policy(policy_id: str, lob: str) -> dict:
     _latency("policy")
-    p = _POLICIES.get(policy_id)
+    p = backend.policy(policy_id)
     if not p:
         return {"error": "not_found", "policy_id": policy_id}
     if p["lob"] != lob:
@@ -307,7 +309,7 @@ def waiting_periods(policy_id: str) -> dict:
     """Waiting-period status per policy, answered from the wording that was in
     force on the POLICY start date - not the one in force today (KB-6)."""
     _latency("policy")
-    p = _POLICIES.get(policy_id)
+    p = backend.policy(policy_id)
     if not p or p["lob"] != "health":
         return {"error": "not_found", "policy_id": policy_id}
 
@@ -353,7 +355,7 @@ def _new_application(quote_id: str, customer_id: str, lob: str,
         "gates": [g | {"state": "not_started"} for g in gates_for(lob)],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    _APPLICATIONS[app_id] = app
+    backend.put_application(app)
     return app
 
 
@@ -361,7 +363,7 @@ def application_start(quote_id: str, customer_id: str,
                       user_id: str = "",
                       idempotency_key: str | None = None) -> dict:
     _latency("policy")
-    q = _QUOTES.get(quote_id)
+    q = backend.get_quote(quote_id)
     if not q:
         return {"error": "not_found", "quote_id": quote_id}
     if date.fromisoformat(q["valid_until"]) < datetime.now(timezone.utc).date():
@@ -377,7 +379,7 @@ def application_start(quote_id: str, customer_id: str,
 
 def application_get(application_id: str) -> dict:
     _latency("policy")
-    return _APPLICATIONS.get(application_id) or {
+    return backend.get_application(application_id) or {
         "error": "not_found", "application_id": application_id}
 
 
@@ -387,6 +389,9 @@ def _set_gate(app: dict, gate_id: str, state: str, detail: str = "") -> None:
             g["state"] = state
             if detail:
                 g["detail"] = detail
+            # In memory the caller held a reference and mutating was enough.
+            # A row does not work that way, so the change is written back.
+            backend.put_application(app)
             return
     raise CoreError("unknown_gate", f"{gate_id} is not a gate on this application")
 
@@ -395,7 +400,7 @@ def kyc_verify(application_id: str, document_type: str,
                reference: str) -> dict:
     """CO-5 gate 1. Deterministic on the reference so a demo is repeatable."""
     _latency("kyc")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
     if document_type not in ("pan", "aadhaar_offline_xml", "ckyc", "passport"):
@@ -416,12 +421,12 @@ def underwrite(application_id: str, declared_conditions: list[str] | None = None
     """CO-5 gate 2 for health. The rules live in products.yaml; the model
     never decides eligibility, it reads this decision back."""
     _latency("uw")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
     rules = underwriting_rules(app["lob"])
     conditions = [c.lower().strip() for c in (declared_conditions or [])]
-    q = _QUOTES.get(app["quote_id"], {})
+    q = backend.get_quote(app["quote_id"]) or {}
 
     for c in conditions:
         if c in rules.get("auto_decline_conditions", []):
@@ -451,7 +456,7 @@ def underwrite(application_id: str, declared_conditions: list[str] | None = None
 def inspection_schedule(application_id: str, slot: str) -> dict:
     """CO-5 gate 2 for motor."""
     _latency("inspection")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
     _set_gate(app, "inspection", "pending", f"surveyor slot {slot}")
@@ -469,7 +474,7 @@ def inspection_result(application_id: str, outcome: str,
     why the tool that calls this is producer-only.
     """
     _latency("inspection")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
     if outcome not in ("clean", "damage_noted", "declined"):
@@ -491,7 +496,7 @@ def payment_collect(application_id: str, amount: float, mode: str,
     """CO-5 gate 3. Money is the one place a duplicate is unforgivable, so
     this is the strictest use of the idempotency key in the mock."""
     _latency("payment")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
     payload = {"application_id": application_id, "amount": round(amount, 2)}
@@ -522,7 +527,7 @@ def policy_issue(application_id: str,
     a gate is pending is the single most expensive sentence in this domain.
     """
     _latency("policy")
-    app = _APPLICATIONS.get(application_id)
+    app = backend.get_application(application_id)
     if not app:
         return {"error": "not_found", "application_id": application_id}
 
@@ -541,7 +546,7 @@ def policy_issue(application_id: str,
     if cached:
         return cached
 
-    q = _QUOTES.get(app["quote_id"], {})
+    q = backend.get_quote(app["quote_id"]) or {}
     pid = f"{q.get('product_id', 'PXX')}-{uuid.uuid4().hex[:7].upper()}"
     today = datetime.now(timezone.utc).date()
     policy = {
@@ -557,9 +562,10 @@ def policy_issue(application_id: str,
         policy["sum_insured"] = q.get("sum_insured")
     else:
         policy["idv"] = q.get("idv")
-    _POLICIES[pid] = policy
+    backend.put_policy(policy)
     app["status"] = "issued"
     app["policy_id"] = pid
+    backend.put_application(app)
     return _remember(idempotency_key, "policy_issue",
                      {"application_id": application_id}, policy)
 
@@ -577,7 +583,7 @@ def claim_register(policy_id: str, lob: str, claim_type: str,
                    incident_date: str, description: str,
                    idempotency_key: str | None = None) -> dict:
     _latency("claims")
-    p = _POLICIES.get(policy_id)
+    p = backend.policy(policy_id)
     if not p:
         return {"error": "not_found", "policy_id": policy_id}
     if p["lob"] != lob:
@@ -604,13 +610,13 @@ def claim_register(policy_id: str, lob: str, claim_type: str,
         "tat_days": prod.get("od_claim_tat_days", 15),
         "registered_at": datetime.now(timezone.utc).isoformat(),
     }
-    _CLAIMS[cid] = claim
+    backend.put_claim(claim)
     return _remember(idempotency_key, "claim_register", payload, claim)
 
 
 def claim_status(claim_id: str) -> dict:
     _latency("claims")
-    return _CLAIMS.get(claim_id) or {"error": "not_found", "claim_id": claim_id}
+    return backend.get_claim(claim_id) or {"error": "not_found", "claim_id": claim_id}
 
 
 def cashless_preauth(policy_id: str, hospital: str, estimate: float,
@@ -618,7 +624,7 @@ def cashless_preauth(policy_id: str, hospital: str, estimate: float,
     """A pre-auth is a PENDING outcome by design: the hospital and the TPA
     both have to answer before anyone knows the number."""
     _latency("claims")
-    p = _POLICIES.get(policy_id)
+    p = backend.policy(policy_id)
     if not p or p["lob"] != "health":
         return {"error": "not_found", "policy_id": policy_id}
     payload = {"policy_id": policy_id, "hospital": hospital,
@@ -643,7 +649,7 @@ def cashless_preauth(policy_id: str, hospital: str, estimate: float,
 def network_search(kind: str, pincode: str, specialty: str | None,
                    limit: int) -> list[dict]:
     _latency("network")
-    rows = _NETWORK.get(kind, [])
+    rows = backend.network(kind)
     if specialty:
         rows = [r for r in rows if specialty.lower() in
                 [s.lower() for s in r.get("specialties", [])]]
@@ -657,7 +663,7 @@ def network_search(kind: str, pincode: str, specialty: str | None,
 def vehicle_lookup(registration: str) -> dict:
     _latency("vehicle")
     key = registration.replace(" ", "").replace("-", "").upper()
-    v = _VEHICLES.get(key)
+    v = backend.vehicle(key)
     if not v:
         return {"error": "not_found", "registration": registration,
                 "detail": "not in the RTO extract; capture the details manually"}
