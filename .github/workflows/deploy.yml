@@ -183,7 +183,7 @@ jobs:
           uv sync --group dev
           uv run python scripts/build_corpus.py
           BUCKET=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-foundation --query "Stacks[0].Outputs[?OutputKey=='CorpusBucketName'].OutputValue" --output text)
-          aws s3 sync data/generated/documents "s3://$BUCKET/corpus/" --delete --only-show-errors --exclude "*" --include "*.md"
+          aws s3 sync data/generated/documents "s3://$BUCKET/corpus/" --delete --only-show-errors --exclude "*" --include "*.md" --include "*.md.metadata.json"
           aws s3 ls "s3://$BUCKET/corpus/" --recursive --summarize | tail -3
           # 74 markdown documents. An empty sync would ingest nothing and
           # still report success, so assert on the count.
@@ -353,7 +353,8 @@ jobs:
         run: |
           REPO="${{ needs.foundation.outputs.repo_uri }}"
           TAG="${GITHUB_SHA::12}"
-          docker build --platform linux/arm64 -t "$REPO:$TAG" -t "$REPO:latest" agent/
+          # Context is the repo root: the image carries the whole app.
+          docker build --platform linux/arm64 -f agent/Dockerfile -t "$REPO:$TAG" -t "$REPO:latest" .
           docker push "$REPO:$TAG"
           docker push "$REPO:latest"
           echo "uri=$REPO:$TAG" >> "$GITHUB_OUTPUT"

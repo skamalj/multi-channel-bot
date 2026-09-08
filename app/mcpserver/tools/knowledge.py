@@ -19,7 +19,23 @@ composing something confident out of four bad chunks (KB-5).
 """
 from __future__ import annotations
 
-from app.knowledge.retriever import search
+from app.knowledge.retriever import search as _local_search
+
+
+def search(query, lob, scopes, k=None, as_of=None, product=None):
+    """Bedrock Knowledge Base when one is deployed, the local index when not.
+
+    Chosen here rather than inside the retriever so the local index stays a
+    self-contained thing the offline tests exercise directly. Both return the
+    same `(accepted, rejected, stats)`, and `stats["backend"]` says which
+    answered - the glass box should never be vague about where a citation
+    came from.
+    """
+    from app.knowledge import kb
+
+    if kb.configured():
+        return kb.search(query, lob, scopes, k=k, as_of=as_of, product=product)
+    return _local_search(query, lob, scopes, k=k, as_of=as_of, product=product)
 from app.mcpserver.registry import tool
 
 
