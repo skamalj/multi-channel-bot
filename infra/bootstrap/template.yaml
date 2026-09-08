@@ -300,6 +300,12 @@ Resources:
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:InvokeAgentRuntime
+                  # Read-only, and the point of the check: an endpoint pins
+                  # to a runtime VERSION and does not follow an update, so a
+                  # new image can deploy, report success and never serve a
+                  # single request. Comparing the two needs to read both.
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
                 Resource:
                   - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
               - Sid: VerifyRetrieval
