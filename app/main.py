@@ -212,6 +212,20 @@ async def agui(request: Request) -> StreamingResponse:
     payload = await request.json()
     cfg = settings()
 
+    # WHO is asking, decided here rather than taken from the payload.
+    #
+    # CopilotKit's `threadId` prop controls ITS transcript, not the AG-UI
+    # RunAgentInput it sends onward - the agent kept receiving a fresh UUID
+    # per run, so consecutive turns landed on different resolver and bot
+    # threads and the agent could not remember the previous sentence. The
+    # whole two-checkpointer design rests on the thread being the person.
+    #
+    # So the identity travels in a header the console sets and this reads,
+    # end to end, and overrides whatever the client put in `threadId`.
+    user = request.headers.get("x-mcb-user")
+    if user:
+        payload["threadId"] = user
+
     if not cfg.agent_runtime_arn:
         return StreamingResponse(
             stream(payload), media_type="text/event-stream",
@@ -280,11 +294,9 @@ def _remember_trace(thread: str, events: list) -> None:
     if len(_LAST_TRACE) >= _TRACE_THREADS and thread not in _LAST_TRACE:
         _LAST_TRACE.pop(next(iter(_LAST_TRACE)), None)
     _LAST_TRACE[thread] = events
-    # Also under a fixed key. CopilotKit mints a NEW threadId per run, so the
-    # console cannot ask for "the trace for my thread" - it does not have a
-    # stable one. This is a single-operator development console, so "the last
-    # turn" is the right question for it to ask, and saying so is better than
-    # pretending the key means something it does not.
+    # Kept as a fallback for any client that has no stable thread of its own.
+    # The console no longer needs it - CopilotKitProvider takes a threadId
+    # prop, so the identity chosen in the UI IS the thread.
     _LAST_TRACE["__last"] = events
 
 

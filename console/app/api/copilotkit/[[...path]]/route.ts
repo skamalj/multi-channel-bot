@@ -35,26 +35,22 @@ import { HttpAgent } from "@ag-ui/client";
 
 const AGUI_URL = process.env.AGUI_URL ?? "http://127.0.0.1:8000/agui";
 
-const protec = new HttpAgent({ url: AGUI_URL });
+// Built per request, because the customer identity travels on a header and
+// the agent must carry it downstream. A module-level agent would freeze
+// whichever identity happened to load the module first.
+const buildEndpoint = (user: string) => {
+  const protec = new HttpAgent({
+    url: AGUI_URL,
+    headers: { "x-mcb-user": user },
+  });
+  return createCopilotEndpoint({
+    runtime: new CopilotRuntime({ agents: { default: protec, protec } }),
+    basePath: "/api/copilotkit",
+  });
+};
 
-const runtime = new CopilotRuntime({
-  // Registered twice, deliberately. `CopilotChat` with no agent named looks
-  // for one called "default" and throws if it is missing - "Agent 'default'
-  // not found after runtime sync. Known agents: [protec]" - so the same
-  // agent answers to both, and `useAgent({ agentId: "protec" })` still works
-  // for the glass box.
-  agents: { default: protec, protec },
-});
-
-// `createCopilotEndpoint` returns a Hono APP, not a fetch handler. Exporting
-// it directly gives "Function.prototype.apply was called on #<_Hono>, which
-// is an object and not a function" - Next wants the `.fetch` method.
-const endpoint = createCopilotEndpoint({
-  runtime,
-  basePath: "/api/copilotkit",
-});
-
-const handler = (req: Request) => endpoint.fetch(req);
+const handler = (req: Request) =>
+  buildEndpoint(req.headers.get("x-mcb-user") ?? "anonymous").fetch(req);
 
 export const GET = handler;
 export const POST = handler;

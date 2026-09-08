@@ -25,3 +25,12 @@ body {
         font-size: 11px; margin-bottom: 12px; }
 .mode.remote { background: #16321f; color: #9ece6a; }
 .mode.local  { background: #33261a; color: #e0af68; }
+
+.who { display: flex; gap: 8px; align-items: center; margin: 8px 0 6px; }
+.who span { color: #5f6675; font-size: 12px; }
+.who select {
+  flex: 1; background: #12151c; color: #e6e8ec;
+  border: 1px solid #2a3040; border-radius: 6px; padding: 5px 8px;
+  font: inherit; font-size: 12px;
+}
+.glass code { color: #7aa2f7; font-family: ui-monospace, monospace; }

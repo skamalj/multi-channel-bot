@@ -3,18 +3,23 @@
 /**
  * The console: CopilotKit's chat on the left, the glass box on the right.
  *
- * The glass box is the reason this project exists, and it is what a plain
- * chat component cannot give you on its own. `useAgent` exposes the agent's
- * event stream, so every AG-UI event the agent emitted - the resolver's
- * routing decision, each tool call, the citation guardrail's verdict, the
- * grounding score - is rendered beside the answer as it arrives.
+ * THE THREAD IS THE PERSON, and that is not decoration - the whole memory
+ * design rests on it. `threadId` becomes the resolver thread (ME-1) and,
+ * with the line of business appended, the bot thread (ME-2). Left to itself
+ * CopilotKit mints a fresh UUID per run, so consecutive turns landed on
+ * different threads and the agent could not remember the previous sentence.
  *
- * The trace events arrive as AG-UI `CUSTOM` events named "trace". That is
- * deliberate: they are not part of the conversation and must never be
- * rendered as though the assistant said them.
+ * So the provider is prop-controlled here: the customer identity is chosen in
+ * the UI, persisted, and passed as `threadId`. Switch identity and you are a
+ * different person to the agent, with a different history - which is the
+ * behaviour worth demonstrating.
  */
 import { useEffect, useRef, useState } from "react";
-import { CopilotChat, useAgent } from "@copilotkit/react-core/v2";
+import {
+  CopilotChat,
+  CopilotKitProvider,
+  useAgent,
+} from "@copilotkit/react-core/v2";
 
 type TraceEvent = {
   kind: string;
@@ -24,7 +29,58 @@ type TraceEvent = {
 
 type Mode = { mode: "remote" | "local"; runtime_arn: string | null };
 
+// The seeded customers and producer from the core store. A phone number is
+// what a WhatsApp message would arrive with, so it is what the console uses.
+const IDENTITIES = [
+  { id: "919820000009", label: "Priya Sharma - health + motor" },
+  { id: "919820000002", label: "Rohit Verma - senior health" },
+  { id: "919820000003", label: "Anita Desai - no policies" },
+  { id: "919820000001", label: "Rakesh Nair - producer" },
+];
+
 export default function Page() {
+  const [userId, setUserId] = useState<string>(IDENTITIES[0].id);
+  const [ready, setReady] = useState(false);
+
+  // Restored so a reload does not silently become a different customer.
+  useEffect(() => {
+    const saved = window.localStorage.getItem("mcb.userId");
+    if (saved) setUserId(saved);
+    setReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (ready) window.localStorage.setItem("mcb.userId", userId);
+  }, [userId, ready]);
+
+  if (!ready) return null;
+
+  return (
+    <CopilotKitProvider
+      runtimeUrl="/api/copilotkit"
+      agent="protec"
+      threadId={userId}
+      // The header is what actually reaches the agent. CopilotKit's threadId
+      // governs its own transcript; the AG-UI payload it sends onward
+      // carries an internal UUID, so the identity is stated explicitly.
+      headers={{ "x-mcb-user": userId }}
+      // Remounted on change so the transcript belongs to the identity it was
+      // produced under, rather than one person's history appearing to be
+      // another's.
+      key={userId}
+    >
+      <Console userId={userId} onUserChange={setUserId} />
+    </CopilotKitProvider>
+  );
+}
+
+function Console({
+  userId,
+  onUserChange,
+}: {
+  userId: string;
+  onUserChange: (id: string) => void;
+}) {
   const { agent } = useAgent({ agentId: "protec" });
   const [events, setEvents] = useState<TraceEvent[]>([]);
   const [mode, setMode] = useState<Mode | null>(null);
@@ -40,79 +96,35 @@ export default function Page() {
       .catch(() => setMode(null));
   }, []);
 
-  useEffect(() => {
-    if (!agent) return;
-    const record = (e: TraceEvent) => setEvents((prev) => [...prev, e]);
-    const subscription: any = agent.subscribe({
-      // Which callbacks a CopilotKit agent actually invokes is not obvious
-      // from the types, so both the generic and the specific ones are wired
-      // and whichever fires wins. `onCustomEvent` is the one that carries
-      // our trace; `onEvent` is the catch-all.
-      onCustomEvent: (p: any) => {
-        const ev = p?.event ?? p;
-        if (ev?.name === "trace" && ev?.value) record(ev.value as TraceEvent);
-      },
-      onToolCallStartEvent: (p: any) => {
-        const ev = p?.event ?? p;
-        record({ kind: "tool", label: String(ev?.toolCallName ?? "") });
-      },
-      onRunStartedEvent: () => setEvents([]),
-      onEvent: ({ event }: { event: Record<string, unknown> }) => {
-        const type = event?.type as string | undefined;
-
-        // Only the cases the specific callbacks above do not cover.
-        if (type === "RUN_STARTED") {
-          // A new turn starts a new trace. Keeping the previous turn's
-          // events would make it look as though this answer consulted
-          // documents it never touched.
-          setEvents([]);
-        }
-        if (type === "RUN_ERROR") {
-          setEvents((prev) => [
-            ...prev,
-            {
-              kind: "error",
-              label: String((event as any).code ?? "RUN_ERROR"),
-              detail: { message: (event as any).message },
-            },
-          ]);
-        }
-      },
-    });
-    // `subscribe` returns a subscription OBJECT, not a function. Calling
-    // the return value directly throws "unsubscribe is not a function" and
-    // leaves the listener attached, so every turn stacks another one.
-    return () => {
-      if (typeof subscription === "function") subscription();
-      else subscription?.unsubscribe?.();
-    };
-  }, [agent]);
-
   // CopilotKit does not forward AG-UI CUSTOM events to a subscriber, so the
   // trace is read from the bridge, which kept what it produced. The events
   // and their order are the real ones; only the liveness is not - they land
   // when the turn ends rather than as it runs.
+  //
+  // Keyed by identity now that the thread is stable, so switching customer
+  // shows that customer's last turn rather than whoever happened to go last.
   useEffect(() => {
-    if (!agent) return;
-    // CopilotKit mints a fresh threadId per run, so there is no stable key
-    // to ask for. "__last" is what this console actually wants.
-    const thread = "__last";
+    let stop = false;
     const tick = async () => {
       try {
-        const r = await fetch(`/api/trace/${encodeURIComponent(thread)}`, {
+        const r = await fetch(`/api/trace/${encodeURIComponent(userId)}`, {
           cache: "no-store",
         });
         const body = await r.json();
-        if (Array.isArray(body.events) && body.events.length) {
+        if (!stop && Array.isArray(body.events)) {
           setEvents(body.events as TraceEvent[]);
         }
       } catch {
         /* the bridge is not up; the chat will say so on its own */
       }
     };
+    tick();
     const id = setInterval(tick, 1500);
-    return () => clearInterval(id);
-  }, [agent]);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [userId, agent]);
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
@@ -126,8 +138,21 @@ export default function Page() {
 
       <aside className="glass">
         <h2>Glass box</h2>
+        <p className="sub">Every AG-UI event this turn produced, in order.</p>
+
+        <label className="who">
+          <span>speaking as</span>
+          <select value={userId} onChange={(e) => onUserChange(e.target.value)}>
+            {IDENTITIES.map((i) => (
+              <option key={i.id} value={i.id}>
+                {i.label}
+              </option>
+            ))}
+          </select>
+        </label>
         <p className="sub">
-          Every AG-UI event this turn produced, in order.
+          thread <code>{userId}</code> - the resolver thread, and with the line
+          of business appended, the bot thread.
         </p>
 
         {mode && (
