@@ -352,7 +352,14 @@ class Agent:
                 #
                 # The score still reaches the trace and the audit record, so a
                 # drift in grounding is visible even though it is not fatal.
-                if v.text and v.text != text:
+                # `outputs[0].text` means two different things depending on
+                # the verdict: the MASKED text when the guardrail rewrote
+                # something, and the BLOCK MESSAGE when it refused. Taking it
+                # unconditionally replaced a perfectly good answer with
+                # "I could not give you a reliable answer" while the trace
+                # still said the block was advisory - the log and the customer
+                # disagreed, which is the worst kind of wrong.
+                if not v.blocked and v.text and v.text != text:
                     # PII the guardrail masked. Take its version.
                     text = v.text
 
