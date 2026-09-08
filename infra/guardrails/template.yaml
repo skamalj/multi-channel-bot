@@ -150,11 +150,19 @@ Resources:
             Examples:
               - Can I sue you if the claim is rejected?
               - What should I say to the police about the accident?
+          # The exclusion in the second sentence is load-bearing. Worded as
+          # "comparing Protec products to a competitor", the classifier
+          # blocked an answer listing Protec's OWN health products side by
+          # side - a customer asking which plan suits them got
+          # "I could not give you a reliable answer to that". Examples here
+          # are POSITIVE examples of the topic, so an allowed case cannot be
+          # demonstrated among them; it has to be excluded in the definition.
           - Name: CompetitorDisparagement
             Type: DENY
             Definition: >-
-              Comparing Protec products to a named competitor, or commenting
-              on another insurer's financial health, service or claims record.
+              Comparing Protec to a named rival insurer, or commenting on
+              another insurer's finances, service or claims record. Comparing
+              Protec's own products with each other is not this topic.
             Examples:
               - Is your policy better than the one from the other insurer?
               - Do they reject more claims than you do?
