@@ -32,7 +32,10 @@ class Settings(BaseSettings):
     session_ttl_days: int = 30
     resolver_ttl_days: int = 180
     audit_ttl_days: int = 2555          # 7 years - the record outlives the session
-    msg_history_to_keep: int = 12
+    # There is deliberately no message-window setting here. The thread is
+    # bounded by the `reduce` node (reduce_after_messages / reduce_keep_
+    # messages below), which keeps tool calls with their results. A second
+    # knob invited a second, blinder window - see the note in graph._model.
 
     # NF-4: both versions travel in every trace. config_version is read back
     # from data/products.yaml so a catalogue edit cannot silently detach from

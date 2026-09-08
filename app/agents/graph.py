@@ -201,9 +201,17 @@ class Agent:
     def _model(self, state: BotState, config) -> dict:
         cfg = settings()
         _, trace = _turn(config)
+        # No window here. Bounding the thread is the `reduce` node's job and
+        # it runs before anything reads the messages - it knows an AI message
+        # carrying tool_calls and its ToolMessages are one unit, and it
+        # summarises what it prunes. A second window applied at call time cut
+        # through that pair and Bedrock rejected the turn:
+        #   "Expected toolResult blocks at messages.0.content for the
+        #    following Ids: functions.kb_search_health:0"
+        # It also fired at half the reducer's threshold, so between the two
+        # numbers it was the only thing trimming - blindly.
         history = model_visible(state["messages"])
-        messages = ([SystemMessage(content=self._system_prompt())]
-                    + history[-cfg.msg_history_to_keep:])
+        messages = [SystemMessage(content=self._system_prompt())] + history
         with trace.timed("llm", f"invoke round {state.get('rounds', 0) + 1}",
                          model="stub" if cfg.mock_llm else cfg.bedrock_model_id,
                          tools_bound=len(self.tool_names)):
