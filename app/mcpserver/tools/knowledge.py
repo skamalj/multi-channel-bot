@@ -43,15 +43,34 @@ def _run(query: str, lob: str, scopes: list[str] | None, k: int | None,
          as_of: str | None) -> dict:
     accepted, rejected, stats = search(query, lob, scopes or ["public"],
                                        k=k, as_of=as_of)
+    # NUMBERED, and that is the whole point.
+    #
+    # The model used to be handed `PHS-POLICY_WORDING-V2#1` and asked to echo
+    # it back. It paraphrased - `PHS-POLICYWORDING-V21`, underscore and hash
+    # gone - and a correct, well-sourced answer was refused because a string
+    # comparison failed. Language models paraphrase things that look like
+    # language, and a structured id looks like language.
+    #
+    # `[1]` does not. There is no fuzzy way to write it, so resolving a
+    # citation stops being a matching problem and becomes an array index.
+    # The real chunk_id travels alongside for the trace and the audit record,
+    # so nothing is lost downstream - the model simply is not asked for it.
+    chunks = []
+    for n, c in enumerate(accepted, 1):
+        d = c.as_dict()
+        d["ref"] = n
+        chunks.append(d)
+
     return {
-        "chunks": [c.as_dict() for c in accepted],
+        "chunks": chunks,
         "grounded": bool(accepted),
         "scopes_searched": scopes or ["public"],
         "instruction": (
-            "Cite a chunk_id in square brackets after every factual sentence "
-            "you take from these. If this list is empty, say you do not have "
-            "an approved source and offer a colleague - do not answer from "
-            "general knowledge."),
+            "Each passage above has a `ref` number. Cite it in square "
+            "brackets - [1], [2] - after every sentence you take from that "
+            "passage. Use the number only, never the chunk_id. If this list "
+            "is empty, say you do not have an approved source and offer a "
+            "colleague - do not answer from general knowledge."),
         "_trace": {
             "rejected": [c.as_dict(with_text=False) for c in rejected],
             "stats": stats,

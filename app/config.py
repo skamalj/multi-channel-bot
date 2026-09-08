@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # guardrail is attached, which is the offline and test posture - the
     # deploy asserts it is set in a real environment rather than letting a
     # missing id silently disable the control.
+    # The claim verifier (app/agents/verify.py). Off in tests and offline;
+    # on wherever there is a model to ask.
+    verifier_enabled: bool = True
+
     guardrail_id: str = ""
     guardrail_version: str = "DRAFT"
 

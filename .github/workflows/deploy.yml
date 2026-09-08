@@ -375,3 +375,18 @@ jobs:
       - name: report
         run: |
           aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query 'Stacks[0].Outputs' --output table
+
+      # A red tick that means "GitHub's runner died" reads exactly like one
+      # that means "the deploy broke", and today it was the first. Say which,
+      # by asking CloudFormation rather than inferring from the job result.
+      - name: what actually happened
+        if: failure()
+        run: |
+          for s in foundation data knowledge guardrails tools agent; do
+            st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-${s} --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+            echo "  ${PREFIX}-${s}: $st"
+          done
+          echo
+          echo "COMPLETE everywhere means the job died after the work landed"
+          echo "(a runner flake) and a re-run is safe. ROLLBACK or IN_PROGRESS"
+          echo "means the deploy itself is the problem."

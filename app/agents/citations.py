@@ -1,142 +1,50 @@
 """Citation enforcement (KB-4) and the refusal path (KB-5).
 
-The rule: when a turn retrieved, every **material claim** in the answer must
-be traceable to a chunk that was actually retrieved. Uncited claims are
-dropped before the answer is composed, not flagged afterwards.
+The rule: when a turn retrieved, every claim in the answer must be supported
+by a passage that was actually retrieved, and every citation must point at
+one of those passages.
 
-What counts as a material claim is the whole design of this file. The naive
-reading - "every sentence needs a citation" - deletes headings, hedges and
-offers of help, and produces answers that are safe and unreadable. The claims
-that hurt somebody in this domain are **specific**: a figure, a percentage, a
-money amount, a date, a promise that something is covered, excluded, free or
-unlimited. Those need a source. "It depends on when your policy started" does
-not.
+**Two jobs, two mechanisms, and the split is the whole design.**
 
-Order of decisions per sentence:
+*Is this sentence a claim, and do the passages support it?* is a language
+question, and it lives in `app/agents/verify.py` on a small model. The
+previous version of this file tried to answer it with word lists, and failed
+in both directions in a single turn: it refused the bot's own question -
+"Ages of family members you want to **cover**" - because the word "cover"
+appeared in it, while letting "The premium is 12,499" through completely
+unchecked, because a comma defeated the number regex. Wrong about a question,
+silent about a price. A regex cannot tell an assertion from a question, and
+no amount of patching will teach it to.
 
-1. Strip markers naming chunks we did not retrieve. A fake citation is worse
-   than none, because it looks like provenance.
-2. A marker for a chunk we really retrieved -> keep.
-3. A heading, a hedge, a question, an offer of help -> keep. It makes no
-   material claim, so there is nothing to cite.
-4. A material claim with no marker, but substantially the retrieved text ->
-   keep and ATTACH the citation. The sentence was grounded; the formatting
-   was not, and deleting a correct sentence is the worse error.
-5. A material claim with no support -> drop, and record it in the trace.
+*Does `[2]` name a passage we actually sent?* is not a language question at
+all. It is array membership, and it stays here in code. Asking a model that
+would invite it to hallucinate the one fact that has to be certain.
 
-If retrieval ran and returned nothing, or every material claim was dropped,
-the turn refuses and offers a human. An empty answer is a correct answer.
+**Citations are NUMBERS now.** The retrieval tool hands the model passages
+labelled `[1]`..`[k]`, not `PHS-POLICY_WORDING-V2#1`. That change removed a
+whole class of failure: the model used to paraphrase the structured id -
+`PHS-POLICYWORDING-V21`, underscore and hash gone - and a correct, properly
+sourced answer was refused because a string comparison failed. There is no
+fuzzy way to write `[2]`.
+
+What remains here:
+
+1. A citation naming a passage that was never sent is stripped. A fake
+   citation is worse than none, because it looks like provenance.
+2. Sentences the verifier reports as unsupported are dropped.
+3. If everything material was dropped, or retrieval ran and returned nothing,
+   the turn refuses and offers a colleague. An empty answer is a correct
+   answer.
 """
 from __future__ import annotations
 
 import re
 
-# A citation bracket may hold more than one id - "[A#1, B#2]" is how a model
-# naturally cites two sources for one sentence, and matching only single-id
-# brackets silently discarded correctly grounded answers.
-BRACKET = re.compile(r"\[([^\[\]]{3,})\]")
-ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-.#_]{3,}")
+# A bracket may hold more than one reference - "[1, 3]" is how a model
+# naturally cites two passages for one sentence.
+BRACKET = re.compile(r"\[([^\[\]]{1,40})\]")
+REF = re.compile(r"\b(\d{1,2})\b")
 
-
-def _looks_like_id(part: str) -> bool:
-    """A chunk id, not an English word.
-
-    "[above]" is an aside and must survive; treating any bracketed word as a
-    failed citation deletes ordinary prose. Every id in this corpus carries a
-    `#section` suffix, and a bare document id is upper-case and hyphenated.
-    """
-    if not ID.fullmatch(part):
-        return False
-    if "#" in part:
-        return True
-    return "-" in part and part == part.upper()
-
-
-_VERSION_SEG = re.compile(r"-V\d+(?=#|$)", re.I)
-
-
-def _resolve_id(cited: str, valid: set[str]) -> str | None:
-    """A cited id that is a near-miss for one we really retrieved.
-
-    Only PHS has dated wording versions, so its chunks are
-    `PHS-POLICY_WORDING-V2#1` while every other product's are
-    `PHST-POLICY_WORDING#1`. A model reading both generalises and writes the
-    versionless form. That is a typo pointing at a chunk that WAS retrieved,
-    not an invented source, and treating it as a hallucination throws away a
-    correctly grounded answer.
-
-    Resolved only when it is UNAMBIGUOUS. If both V1 and V2 were retrieved,
-    the model has not said which wording it means, and that is exactly the
-    distinction KB-6 exists to keep.
-    """
-    target = _VERSION_SEG.sub("", cited)
-    matches = {v for v in valid if _VERSION_SEG.sub("", v) == target}
-    return matches.pop() if len(matches) == 1 else None
-
-
-def _citations_in(text: str) -> list[tuple[str, list[str]]]:
-    """(whole bracket, ids inside it) for every bracket that IS a citation."""
-    out = []
-    for m in BRACKET.finditer(text):
-        parts = [p.strip() for p in re.split(r"[,;]", m.group(1))]
-        ids = [p for p in parts if _looks_like_id(p)]
-        if ids:
-            out.append((m.group(0), ids))
-    return out
-
-
-_SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[*#\-])")
-_WORD = re.compile(r"[a-z0-9]+")
-_MD = re.compile(r"[*_`#>]+")
-
-REPAIR_OVERLAP = 0.5
-
-# A figure that is not touching a letter. "Q-9D57E12C" is an identifier, not
-# the numbers 9, 57 and 12, and treating it as three figures would reject a
-# quote id for not appearing in its own quote.
-_NUMBER = re.compile(r"(?<![A-Za-z0-9])\d[\d,]*(?:\.\d+)?(?![A-Za-z0-9])")
-
-# A claim that can hurt somebody is a specific one - and specifically, it is
-# a QUANTITY or a promise, not any character that happens to be a digit.
-#
-# "any figure" was the first version of this and it was wrong in a way that
-# only showed up in a transactional conversation: "Application ID: A-47C234A2"
-# and "1. KYC verification" both contain digits, so a bot walking a customer
-# through issuance had every sentence treated as an unsourced claim and
-# refused its way out of its own journey. An identifier is a reference, not an
-# assertion about cover.
-#
-# Two kinds, and the difference decides what can rescue them. A QUANTITY is
-# checkable against what a tool returned. A PROMISE is not - "unlimited
-# overseas cover" has no figure to verify, so nothing but a cited source can
-# support it.
-_QUANTITY = [
-    re.compile(r"(?:\brs\.?\s*|₹)\s*[\d,]+", re.I),          # money
-    re.compile(r"\d+\s*(?:%|per ?cent)", re.I),               # percentage
-    re.compile(r"\b\d+\s*(?:hour|day|week|month|year)s?\b", re.I),
-    re.compile(r"(?<![A-Za-z0-9])\d{4,}(?![A-Za-z0-9])"),     # amounts, years
-    re.compile(r"\b(lakh|crore)\b", re.I),
-]
-_PROMISE = [
-    re.compile(r"\b(cover(?:ed|s)?|exclud(?:ed|es)|payable|admissible|"
-               r"reimburse\w*|refund\w*|includes?|entitled|eligible|"
-               r"waiting period|no claim bonus)\b", re.I),
-    re.compile(r"\b(free|complimentary|unlimited|guaranteed|bonus|cashback|"
-               r"discount|waived|lifetime)\b", re.I),
-    # A DECISION belongs to the core, and its vocabulary is closed. A model
-    # that writes "Underwriting Decision: CLEARED" without calling
-    # underwriting has told the customer the most consequential thing in the
-    # journey, and it is not true. The gate caught that two turns later - by
-    # which point they had been told.
-    re.compile(r"\b(cleared|approved|issued|sanctioned|settled|declined|"
-               r"repudiated|rejected|in force)\b", re.I),
-]
-_MATERIAL = _QUANTITY + _PROMISE
-
-# Deliberately avoids the word "approved". It is in the decision vocabulary
-# below - "approved" is what a claim or an underwriting file is - so a
-# refusal phrased with it trips the very check it came from, and any caller
-# re-inspecting the final reply sees an unsupported decision word.
 REFUSAL = (
     "I could not find anything in our documented sources that answers that, "
     "so I would rather not guess. I can put you through to a colleague who "
@@ -150,225 +58,78 @@ REFUSAL_ACTION = (
     "and I would rather tell you than let you think it went through. Shall I "
     "put you through to a colleague who can finish it?")
 
-
-# A list marker is formatting. Leaving it in makes "1. Your registration
-# number" a sentence containing a figure, so a bot asking two clarifying
-# questions in a numbered list looked like it was making two unsourced
-# claims - and the whole turn refused.
-_LIST_MARKER = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[*#\-])")
 
 
-def _plain(s: str) -> str:
-    """Formatting off, so the tests below see the sentence, not its markup."""
-    return _LIST_MARKER.sub("", _MD.sub("", s)).strip()
+# ---------------------------------------------------------------------------
+# citation references
+# ---------------------------------------------------------------------------
+def refs_in(text: str) -> list[tuple[str, list[int]]]:
+    """Every bracket in `text`, with the passage numbers inside it."""
+    out: list[tuple[str, list[int]]] = []
+    for m in BRACKET.finditer(text or ""):
+        inner = m.group(1)
+        nums = [int(n) for n in REF.findall(inner)]
+        if nums:
+            out.append((m.group(0), nums))
+    return out
 
 
-def _tokens(text: str) -> set[str]:
-    return {w for w in _WORD.findall(text.lower()) if len(w) > 3}
+def strip_unknown_refs(text: str, valid: set[int]) -> tuple[str, list[int]]:
+    """Remove brackets naming passages that were never sent.
 
-
-def _numbers(text: str) -> set[str]:
-    return {n.replace(",", "").rstrip(".") for n in _NUMBER.findall(text or "")}
-
-
-def _figures_supported(sentence: str, facts: str) -> bool:
-    """Every figure in the sentence appears in the tool results behind it.
-
-    This is the check that catches the expensive class of drift: a model
-    restating a premium, an IDV, a date or a registration year from its own
-    earlier prose rather than from what the core just returned. A quote whose
-    total is off by a rupee is a mis-sold policy, and no amount of fluent
-    formatting around it makes it less so.
+    Returns the cleaned text and the invented numbers, which belong in the
+    trace: a model citing `[7]` when four passages were given has fabricated
+    provenance, and that is worth seeing even though the sentence may survive
+    on the verifier's judgement.
     """
-    quoted = _numbers(sentence)
-    if not quoted:
-        return True
-    known = _numbers(facts)
-    known_floats = []
-    for k in known:
-        try:
-            known_floats.append(float(k))
-        except ValueError:                                   # pragma: no cover
-            pass
-    for q in quoted:
-        if q in known:
+    invented: list[int] = []
+    cleaned = text or ""
+    for bracket, nums in refs_in(cleaned):
+        unknown = [n for n in nums if n not in valid]
+        if not unknown:
             continue
-        try:
-            qf = float(q)
-        except ValueError:
-            return False
-        # A sensible rounding of a real figure is still that figure.
-        if not any(abs(qf - k) <= 0.51 for k in known_floats):
-            return False
-    return True
+        invented.extend(unknown)
+        keep = [n for n in nums if n in valid]
+        replacement = ("[" + ", ".join(str(n) for n in keep) + "]") if keep else ""
+        cleaned = cleaned.replace(bracket, replacement)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), sorted(set(invented))
 
 
-def _is_structural(s: str) -> bool:
-    """A heading or a lead-in. It introduces claims; it does not make one.
+def cited_chunk_ids(text: str, chunks: list[dict]) -> list[str]:
+    """The real chunk ids behind the numbers the model cited.
 
-    A clause ending in a colon is structural however long it is. "IRDAI has
-    set the maximum waiting period for pre-existing diseases at:" mentions a
-    waiting period and cites nothing, so a naive materiality test drops it -
-    and orphans the three cited bullets it was introducing, which is a worse
-    answer than either keeping or dropping the whole passage.
+    The audit record names documents, not positions - `[2]` means nothing six
+    months from now, and the whole point of a citation is that somebody can
+    go and read the thing.
     """
-    raw = s.strip()
-    if raw.startswith("#"):
-        return True
-    if raw.startswith("**") and raw.endswith("**"):
-        return True
-    return _plain(raw).endswith(":")
+    by_ref = {c["ref"]: c.get("chunk_id", "") for c in chunks if "ref" in c}
+    out: list[str] = []
+    for _, nums in refs_in(text):
+        for n in nums:
+            cid = by_ref.get(n)
+            if cid and cid not in out:
+                out.append(cid)
+    return out
 
 
-def _is_material(s: str) -> bool:
-    plain = _plain(s)
-    return any(p.search(plain) for p in _MATERIAL)
-
-
-def _is_promise(s: str) -> bool:
-    """A claim about cover, with no figure in it to check."""
-    plain = _plain(s)
-    return any(p.search(plain) for p in _PROMISE)
-
-
-def _is_question(s: str) -> bool:
-    plain = _plain(s)
-    return not plain or plain.endswith("?")
-
-
-def _needs_source(s: str) -> bool:
-    """A sentence that must be traceable to something.
-
-    Note what is NOT here: a length shortcut. "The waiting period is two
-    weeks." is six words and is exactly the sentence this file exists to
-    stop, so brevity cannot be a reason to trust a claim.
-    """
-    return _is_material(s) and not _is_structural(s) and not _is_question(s)
-
-
-def enforce(answer: str, chunks: list[dict],
-            other_tool_evidence: bool = False,
-            tool_facts: str = "",
-            retrieval_ran: bool = True) -> tuple[str, dict]:
-    """Returns (answer, report). `chunks` is what retrieval actually returned.
-
-    `other_tool_evidence` is True when the turn also called a core tool - a
-    premium, a policy record, a gate decision. Those sentences are grounded
-    in a tool result rather than a document, and the tool call is itself in
-    the trace, so they are not dropped for want of a chunk id.
-
-    `tool_facts` is what those tools actually returned, and it is checked
-    rather than assumed. Treating "a core tool ran" as a blanket exemption
-    was a real hole: it let a quote summary say "Maruti Swift VXI" over a
-    lookup that returned a Baleno, because one true sentence about the
-    premium licensed every other sentence in the same answer. It carries the
-    facts established EARLIER in the same journey too - an application id
-    quoted back three turns after the core returned it is a reference, not a
-    new claim.
-
-    `retrieval_ran` only picks the wording of a refusal: a customer who asked
-    to issue a policy and is told "I do not have an approved source" hears a
-    knowledge gap rather than "nothing was done".
-    """
-    valid = {c["chunk_id"] for c in chunks}
-    report: dict = {"cited": [], "dropped": [], "repaired": [],
-                    "hallucinated": [], "refused": False}
-
-    if not chunks:
-        # No documents behind this answer. That covers two cases and they are
-        # NOT the same: a core tool answered (a premium, a policy record), or
-        # nothing did.
-        if other_tool_evidence:
-            # A core tool answered. Its figures are the truth, so every
-            # figure in the prose has to be one of them.
-            lines = _split(answer)
-            kept = [ln for ln in lines
-                    if not _needs_source(ln)
-                    or _figures_supported(ln, tool_facts)]
-            report["dropped"] = [_plain(ln)[:160] for ln in lines
-                                 if ln not in kept]
-            return _join(kept) or answer, report
-        # Nothing did. Only text that makes no material claim may stand - a
-        # greeting or a clarifying question is a fine answer with no sources;
-        # "health insurance does not usually cover that" is not, however
-        # reasonable it sounds, because nothing here checked it.
-        # A sentence whose only "material" content is a figure this journey
-        # already established - an application id, the quote total the core
-        # returned two turns ago - is a reference, not a new claim. A PROMISE
-        # has no figure to check and can only be supported by a source.
-        unsupported = [_plain(s) for s in _split(answer)
-                       if _needs_source(s)
-                       and (_is_promise(s)
-                            or not _figures_supported(s, tool_facts))]
-        if not unsupported:
-            return answer, report
-        report["dropped"] = [u[:160] for u in unsupported]
-        report["refused"] = True
-        return (REFUSAL if retrieval_ran else REFUSAL_ACTION), report
-
-    kept: list[str] = []
-    material_kept = 0
-    for sentence in _split(answer):
-        raw = sentence.strip()
-        if not raw:
+def split(answer: str) -> list[str]:
+    """Sentence split that leaves list items and headings alone."""
+    out: list[str] = []
+    for line in (answer or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
             continue
+        if re.match(r"^([-*•]|\d+[.)]|#)\s*", stripped):
+            out.append(line)
+        else:
+            out.extend(_SENTENCE.split(line))
+    return [o for o in out if o.strip()]
 
-        found: list[str] = []
-        for bracket, ids in _citations_in(raw):
-            good, bad, fixed = [], [], False
-            for i in ids:
-                if i in valid:
-                    good.append(i)
-                    continue
-                resolved = _resolve_id(i, valid)
-                if resolved:
-                    good.append(resolved)
-                    fixed = True
-                else:
-                    bad.append(i)
-            report["hallucinated"].extend(bad)
-            found.extend(good)
-            if bad or fixed:
-                # Keep the real ids, drop the invented ones. A fake marker is
-                # worse than none because it looks like provenance.
-                raw = raw.replace(bracket,
-                                  f"[{', '.join(good)}]" if good else "")
-        raw = re.sub(r"\s{2,}", " ", raw).strip()
 
-        if found:
-            report["cited"].extend(found)
-            kept.append(raw)
-            material_kept += 1
-            continue
-
-        if not _needs_source(raw):
-            kept.append(raw)
-            continue
-
-        if other_tool_evidence:
-            if _figures_supported(raw, tool_facts):
-                kept.append(raw)
-                material_kept += 1
-            else:
-                report["dropped"].append(_plain(raw)[:160])
-            continue
-
-        support = _best_support(raw, chunks)
-        if support:
-            chunk_id, overlap = support
-            report["repaired"].append({"chunk_id": chunk_id,
-                                       "overlap": round(overlap, 2)})
-            report["cited"].append(chunk_id)
-            kept.append(f"{raw.rstrip('.')} [{chunk_id}].")
-            material_kept += 1
-            continue
-
-        report["dropped"].append(_plain(raw)[:160])
-
-    if not material_kept:
-        report["refused"] = True
-        return REFUSAL, report
-    return _join(kept), report
+def _looks_structured(lines: list[str]) -> bool:
+    return any(l.strip().startswith(("#", "**", "-", "*", "•")) or
+               re.match(r"^\s*\d+[.)]\s", l) for l in lines)
 
 
 def _join(kept: list[str]) -> str:
@@ -378,39 +139,85 @@ def _join(kept: list[str]) -> str:
             else " ".join(kept).strip())
 
 
-def _looks_structured(lines: list[str]) -> bool:
-    """Keep the model's shape when it wrote one - headings and bullets read
-    as a list, not as a paragraph with asterisks in it."""
-    return any(l.strip().startswith(("#", "**", "-", "*", "•")) or
-               re.match(r"^\s*\d+[.)]\s", l) for l in lines)
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[*_`#>]+", "", s or "")).strip().lower()
 
 
-def _split(answer: str) -> list[str]:
-    """Sentence split that leaves list items and headings alone."""
-    out: list[str] = []
-    for line in (answer or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if re.match(r"^([-*•]|\d+[.)]|#)\s*", stripped) or _is_structural(line):
-            out.append(line)
+# ---------------------------------------------------------------------------
+# enforcement
+# ---------------------------------------------------------------------------
+def enforce(answer: str, chunks: list[dict],
+            other_tool_evidence: bool = False,
+            established: list[str] | None = None,
+            retrieval_ran: bool = True,
+            action_attempted: bool = False) -> tuple[str, dict]:
+    """Returns (answer, report).
+
+    `chunks` is what retrieval actually returned, each carrying a `ref`.
+    `other_tool_evidence` is True when a core tool ran - a premium, a policy
+    record, a gate decision. Those sentences are grounded in a tool result
+    rather than a document, and the tool call is itself in the trace.
+    `established` is what this conversation already confirmed with a source,
+    so a follow-up may restate it.
+    `action_attempted` picks the refusal wording, and it means what it says:
+    a state-changing tool ran. Choosing it by whether retrieval happened -
+    as this once did - told a customer asking a question "I have not done
+    that", describing a transaction they never started.
+    """
+    from app.agents import verify
+
+    report: dict = {"cited": [], "dropped": [], "invented_refs": [],
+                    "verifier": "not_run", "refused": False}
+
+    valid = {c["ref"] for c in chunks if "ref" in c}
+
+    # 1. A citation naming a passage we never sent is provenance theatre.
+    answer, invented = strip_unknown_refs(answer, valid)
+    report["invented_refs"] = invented
+
+    # Nothing retrieved and nothing else to stand on: there is no answer to
+    # give, whatever the model wrote.
+    if retrieval_ran and not chunks and not other_tool_evidence:
+        report["refused"] = True
+        return (REFUSAL_ACTION if action_attempted else REFUSAL), report
+
+    # 2. Does the source material support what was written?
+    verdict = verify.check(answer, chunks, established=established)
+    report["verifier"] = ("ran" if verdict.ran
+                          else (verdict.error or "not_configured"))
+
+    if not verdict.ran:
+        # Degraded, and the trace says so. The reference check above still
+        # applied, so a fabricated citation was still removed.
+        report["cited"] = cited_chunk_ids(answer, chunks)
+        return answer, report
+
+    unsupported = {_norm(u) for u in verdict.unsupported}
+    if not unsupported:
+        report["cited"] = cited_chunk_ids(answer, chunks)
+        return answer, report
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for sentence in split(answer):
+        if _norm(sentence) in unsupported:
+            dropped.append(sentence.strip()[:160])
         else:
-            out.extend(_SENTENCE.split(line))
-    return [o for o in out if o.strip()]
+            kept.append(sentence)
 
+    # The verifier quotes sentences; if none matched, its quoting was loose
+    # rather than the answer being clean, so treat the whole answer as
+    # unsupported rather than silently passing it.
+    if not dropped:
+        dropped = [u[:160] for u in verdict.unsupported]
+        kept = []
 
-def _best_support(sentence: str, chunks: list[dict]) -> tuple[str, float] | None:
-    """The chunk this sentence was plainly taken from, if there is one."""
-    st = _tokens(_plain(sentence))
-    if len(st) < 4:
-        return None
-    best, best_overlap = None, 0.0
-    for c in chunks:
-        ct = _tokens(c.get("text", ""))
-        if not ct:
-            continue
-        overlap = len(st & ct) / len(st)
-        if overlap > best_overlap:
-            best, best_overlap = c["chunk_id"], overlap
-    return (best, best_overlap) if best and best_overlap >= REPAIR_OVERLAP \
-        else None
+    report["dropped"] = dropped
+
+    if not kept:
+        report["refused"] = True
+        return (REFUSAL_ACTION if action_attempted else REFUSAL), report
+
+    text = _join(kept)
+    report["cited"] = cited_chunk_ids(text, chunks)
+    return text, report

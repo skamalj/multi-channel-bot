@@ -30,6 +30,10 @@ Parameters:
     Type: Number
     Default: 0.4
     Description: >-
+      An ALARM level, not a gate. Grounding is recorded and watched; it
+      does not block, because it cannot reliably tell a good answer from a
+      fabricated one on this bot's output style - measured below.
+
       CALIBRATED, not chosen. It started at 0.75 on the reasoning that a wrong
       answer about cover costs more than a refusal, and that number refused a
       GOOD answer in production: the knowledge base returned the right four

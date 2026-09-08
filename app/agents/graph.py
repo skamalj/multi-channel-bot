@@ -33,6 +33,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
 from app.agents import citations, confirm, guardrail, reduce as reducer
+from app.mcpserver.registry import get_tool as spec_for_tool
 from app.agents.state import BotState
 from app.config import settings
 from app.llm.bedrock import get_llm
@@ -300,15 +301,35 @@ class Agent:
         # The guardrail runs on EVERY answer, including one produced with no
         # tool call at all - a model that skips retrieval and answers from
         # general knowledge is exactly what KB-4 exists to catch.
+        # Was anything ATTEMPTED this turn? Only a tool that changes state
+        # makes "I have not done that" the right thing to say; for an
+        # informational turn it describes a transaction the customer never
+        # started.
+        action_attempted = False
+        for name in tools_called:
+            spec = spec_for_tool(name)
+            if spec is not None and getattr(spec, "effect", "read") != "read":
+                action_attempted = True
+                break
+
+        # What this conversation already confirmed WITH a source. Without it
+        # a follow-up - "how many months was that again?" - is refused for
+        # restating something the customer was correctly told a moment ago,
+        # which is how a bot ends up unable to hold a conversation.
+        established = (list(state.get("known_facts") or [])
+                       + list(state.get("tool_facts") or []))
+
         text, report = citations.enforce(
-            text, retrieved, bool(state.get("used_core_tool")), known,
-            retrieval_ran=any(t in RETRIEVAL_TOOLS for t in tools_called))
+            text, retrieved, bool(state.get("used_core_tool")),
+            established=established,
+            retrieval_ran=any(t in RETRIEVAL_TOOLS for t in tools_called),
+            action_attempted=action_attempted)
 
         trace.add("guardrail", "citations",
                   cited=sorted(set(report.get("cited", []))),
-                  repaired=report.get("repaired", []),
                   dropped=report.get("dropped", []),
-                  hallucinated=sorted(set(report.get("hallucinated", []))),
+                  invented_refs=report.get("invented_refs", []),
+                  verifier=report.get("verifier"),
                   refused=report.get("refused", False),
                   grounded_by=("retrieval" if retrieved
                                else "core tool" if state.get("used_core_tool")
@@ -324,9 +345,14 @@ class Agent:
                 v = guardrail.screen_retrieved(
                     passages, _last_human_text(state) or "", text)
                 if v.action not in ("NOT_CONFIGURED", "ERROR"):
+                    # `alarm` rather than `blocked`, because that is what it
+                    # is. A score below the threshold is worth seeing and is
+                    # not worth refusing a correct answer over - the same
+                    # answer scored 0.56 and 0.14 on consecutive runs.
                     trace.add("guardrail", "grounding", action=v.action,
                               grounding=v.grounding, relevance=v.relevance,
-                              reasons=v.reasons, blocked=v.blocked)
+                              reasons=v.reasons, alarm=v.blocked,
+                              enforced=False)
                 # Grounding is RECORDED, not enforced, and that is a
                 # measurement rather than a preference.
                 #
