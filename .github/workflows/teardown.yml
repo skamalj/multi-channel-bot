@@ -109,7 +109,7 @@ jobs:
       # error - teardown has to be re-runnable after a partial failure.
       - name: delete stacks
         run: |
-          for s in agent tools guardrails knowledge data foundation; do
+          for s in whatsapp agent tools guardrails knowledge data foundation; do
             name="${PREFIX}-${s}"
             if aws cloudformation describe-stacks --stack-name "$name" >/dev/null 2>&1; then
               echo "::group::deleting $name"
@@ -143,7 +143,7 @@ jobs:
           report() { echo "  SURVIVING $1"; found=1; }
 
           # Stacks are the authoritative answer for everything inside them.
-          for s in foundation data knowledge guardrails tools agent; do
+          for s in foundation data knowledge guardrails tools agent whatsapp; do
             if aws cloudformation describe-stacks --stack-name ${PREFIX}-${s} >/dev/null 2>&1; then
               report "stack ${PREFIX}-${s}"
             fi
@@ -164,6 +164,11 @@ jobs:
 
           for u in $(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?starts_with(Name,'${PREFIX}-')].Id" --output text); do
             report "cognito $u"
+          done
+
+          for q in $(aws sqs list-queues --queue-name-prefix "${PREFIX}-" --query 'QueueUrls' --output text 2>/dev/null); do
+            [ "$q" = "None" ] && continue
+            report "sqs $q"
           done
 
           for v in $(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${PREFIX}" --query 'Vpcs[].VpcId' --output text); do

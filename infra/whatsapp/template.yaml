@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  mcb-whatsapp - the WhatsApp channel. Separately deployable: it depends on
+  the agent but nothing depends on it, so it can be deployed, left out, or
+  removed without touching the rest.
+
+#            Meta
+#              |  HTTPS, signature-verified
+#              v
+#   +----------------------+
+#   |  webhook Lambda      |  verify, parse, enqueue. Nothing else.
+#   +----------+-----------+
+#              |  SQS inbound (FIFO, per-sender group)
+#              v
+#   +----------------------+
+#   |  consumer Lambda     |  invoke_agent_runtime over AG-UI
+#   +----------+-----------+
+#              |  SQS outbound (FIFO)
+#              v
+#   +----------------------+
+#   |  formatter Lambda    |  typeset for a phone, then Graph API send
+#   +----------------------+
+#
+# Queues rather than direct calls, for a reason that shows up in production
+# rather than in a demo: Meta retries a webhook that is slow to answer and
+# eventually disables the subscription. An agent turn takes seconds. Putting
+# the queue between them means the webhook always answers in milliseconds and
+# a slow turn costs nobody anything.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcb
+    AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
+  AgentRuntimeArn:
+    Type: String
+    Description: From mcb-agent. This stack is useless without it.
+  AgentQualifier:
+    Type: String
+    Default: live
+  GuardrailId:
+    Type: String
+    Default: ''
+  GuardrailVersion:
+    Type: String
+    Default: DRAFT
+  FormatterModelId:
+    Type: String
+    Default: apac.amazon.nova-lite-v1:0
+    Description: Small model. Typesetting is not a reasoning task.
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: Attempts before a message goes to its dead-letter queue.
+
+Resources:
+
+  # --------------------------------------------------------------- queues
+  # FIFO. One person's messages must arrive in the order they were sent, and
+  # the MessageGroupId is the sender - so two customers never queue behind
+  # each other, but one customer's turns never overtake each other either.
+  InboundDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-inbound-dlq.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600      # 14 days, the maximum
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
+  InboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-inbound.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false      # ids are supplied explicitly
+      # Comfortably longer than the consumer's timeout. Shorter and a slow
+      # turn would be redelivered while it was still being answered, and the
+      # customer would get two replies.
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboundDlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
+  OutboundDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-outbound-dlq.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
+  OutboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-outbound.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OutboundDlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
+  # -------------------------------------------------------------- webhook
+  # The only publicly reachable resource in the build. AuthType NONE is not
+  # a lapse - Meta cannot sign with SigV4 - which is exactly why the function
+  # verifies X-Hub-Signature-256 before it believes a single byte.
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-wa-webhook"
+      CodeUri: ../../whatsapp/webhook/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 10                 # Meta is impatient; so is this
+      MemorySize: 256
+      Environment:
+        Variables:
+          INBOUND_QUEUE_URL: !Ref InboundQueue
+          PARAM_PREFIX: !Sub "/${Prefix}/whatsapp"
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InboundQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "${Prefix}/whatsapp/*"
+      Tags:
+        Project: !Ref Prefix
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-wa-webhook"
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------- consumer
+  ConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-wa-consumer"
+      CodeUri: ../../whatsapp/consumer/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 300                # an agent turn, generously
+      MemorySize: 512
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+          AGENT_QUALIFIER: !Ref AgentQualifier
+          OUTBOUND_QUEUE_URL: !Ref OutboundQueue
+      Events:
+        Inbound:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InboundQueue.Arn
+            # One at a time. A batch of ten would share a 300s timeout and
+            # one slow turn would starve the rest.
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt InboundQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OutboundQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: bedrock-agentcore:InvokeAgentRuntime
+              Resource:
+                - !Ref AgentRuntimeArn
+                - !Sub "${AgentRuntimeArn}/*"
+      Tags:
+        Project: !Ref Prefix
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-wa-consumer"
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------ formatter
+  # The second agent. Presentation only - it may not change what was said,
+  # and it is checked against the original before anything is sent.
+  FormatterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-wa-formatter"
+      CodeUri: ../../whatsapp/formatter/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          FORMATTER_MODEL_ID: !Ref FormatterModelId
+          PARAM_PREFIX: !Sub "/${Prefix}/whatsapp"
+          GUARDRAIL_ID: !Ref GuardrailId
+          GUARDRAIL_VERSION: !Ref GuardrailVersion
+      Events:
+        Outbound:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OutboundQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt OutboundQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "${Prefix}/whatsapp/*"
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+            - Effect: Allow
+              Action: bedrock:ApplyGuardrail
+              Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+      Tags:
+        Project: !Ref Prefix
+
+  FormatterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-wa-formatter"
+      RetentionInDays: 14
+
+  # A message reaching a dead-letter queue means a customer asked something
+  # and got nothing back. That is worth knowing about.
+  InboundDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-wa-inbound-dlq"
+      AlarmDescription: A WhatsApp message could not be answered.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt InboundDlq.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  OutboundDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-wa-outbound-dlq"
+      AlarmDescription: An answer was produced but never delivered.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt OutboundDlq.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebhookUrl:
+    Description: >-
+      Configure this in the Meta app as the WhatsApp webhook callback URL,
+      with the verify token from /mcb/whatsapp/verify-token.
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+    Export: { Name: !Sub "${Prefix}-wa-webhook-url" }
+  InboundQueueUrl:
+    Value: !Ref InboundQueue
+  OutboundQueueUrl:
+    Value: !Ref OutboundQueue
+  InboundDlqUrl:
+    Value: !Ref InboundDlq
+  OutboundDlqUrl:
+    Value: !Ref OutboundDlq

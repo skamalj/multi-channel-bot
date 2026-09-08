@@ -1,0 +1,146 @@
+name: deploy-whatsapp
+
+# Separate from `deploy` on purpose. The WhatsApp channel depends on the
+# agent, and nothing depends on it - so it is deployed, skipped or removed
+# without touching the rest of the build. It also needs credentials from Meta
+# that the core stacks do not, and a stack that cannot deploy without a
+# third-party secret has no business blocking one that can.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'deploy or destroy'
+        required: true
+        default: deploy
+        type: choice
+        options: [deploy, destroy]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-whatsapp
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  PREFIX: mcb
+
+jobs:
+  whatsapp:
+    name: mcb-whatsapp
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install --quiet aws-sam-cli
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-whatsapp-${{ github.run_id }}
+
+      - name: destroy
+        if: inputs.action == 'destroy'
+        run: |
+          if aws cloudformation describe-stacks --stack-name ${PREFIX}-whatsapp >/dev/null 2>&1; then
+            aws cloudformation delete-stack --stack-name ${PREFIX}-whatsapp --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-whatsapp
+            echo "deleted"
+          else
+            echo "absent, nothing to do"
+          fi
+
+      # Four values come from the Meta app and cannot be generated here. Checked
+      # BEFORE deploying: a stack that comes up and then fails its first webhook
+      # on a missing parameter is a worse outcome than one that refuses to
+      # deploy and says which parameter is missing.
+      - name: required parameters exist
+        if: inputs.action == 'deploy'
+        run: |
+          missing=0
+          for p in verify-token app-secret access-token phone-number-id; do
+            if aws ssm get-parameter --name "/${PREFIX}/whatsapp/$p" >/dev/null 2>&1; then
+              echo "  ok      /${PREFIX}/whatsapp/$p"
+            else
+              echo "  MISSING /${PREFIX}/whatsapp/$p"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "Set them from the Meta app dashboard, for example:"
+            echo "  aws ssm put-parameter --name /${PREFIX}/whatsapp/app-secret --type SecureString --value '...'"
+            exit 1
+          fi
+
+      - name: the agent must exist first
+        if: inputs.action == 'deploy'
+        id: agent
+        run: |
+          arn=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query "Stacks[0].Outputs[?OutputKey=='AgentRuntimeArn'].OutputValue" --output text 2>/dev/null || true)
+          if [ -z "$arn" ] || [ "$arn" = "None" ]; then
+            echo "mcb-agent is not deployed; deploy it before the channel"
+            exit 1
+          fi
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+          gid=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-guardrails --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" --output text 2>/dev/null || echo "")
+          gver=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-guardrails --query "Stacks[0].Outputs[?OutputKey=='GuardrailVersion'].OutputValue" --output text 2>/dev/null || echo "DRAFT")
+          echo "gid=$gid" >> "$GITHUB_OUTPUT"
+          echo "gver=$gver" >> "$GITHUB_OUTPUT"
+
+      - name: clear a failed first create
+        if: inputs.action == 'deploy'
+        run: |
+          st=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-whatsapp --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)
+          if [ "$st" = "ROLLBACK_COMPLETE" ]; then
+            aws cloudformation delete-stack --stack-name ${PREFIX}-whatsapp --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+            aws cloudformation wait stack-delete-complete --stack-name ${PREFIX}-whatsapp
+          fi
+
+      - name: sam build
+        if: inputs.action == 'deploy'
+        run: sam build --template infra/whatsapp/template.yaml --build-dir .aws-sam/whatsapp
+
+      - name: sam deploy
+        if: inputs.action == 'deploy'
+        run: |
+          sam deploy --template-file .aws-sam/whatsapp/template.yaml --stack-name ${PREFIX}-whatsapp --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --s3-bucket ${{ vars.AWS_ARTIFACTS_BUCKET }} --s3-prefix ${PREFIX}-whatsapp --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset --tags Project=${PREFIX} --parameter-overrides Prefix=${PREFIX} AgentRuntimeArn="${{ steps.agent.outputs.arn }}" GuardrailId="${{ steps.agent.outputs.gid }}" GuardrailVersion="${{ steps.agent.outputs.gver }}"
+
+      # The webhook cannot be tested end to end without Meta, but the two
+      # halves that do not need Meta can be: that the URL exists and answers,
+      # and that it REFUSES an unsigned request. The second is the one worth
+      # asserting - a public endpoint that accepted anything would let a
+      # stranger put words in a customer's mouth.
+      - name: the webhook rejects what it should
+        if: inputs.action == 'deploy'
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-whatsapp --query "Stacks[0].Outputs[?OutputKey=='WebhookUrl'].OutputValue" --output text)
+          echo "webhook: $URL"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'content-type: application/json' -d '{"entry":[]}')
+          echo "unsigned POST -> $code"
+          [ "$code" = "403" ] || { echo "expected 403 for an unsigned POST"; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$URL?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=x")
+          echo "bad verify token -> $code"
+          [ "$code" = "403" ] || { echo "expected 403 for a bad verify token"; exit 1; }
+
+          TOKEN=$(aws ssm get-parameter --name "/${PREFIX}/whatsapp/verify-token" --with-decryption --query 'Parameter.Value' --output text)
+          body=$(curl -s "$URL?hub.mode=subscribe&hub.verify_token=$TOKEN&hub.challenge=echo-me")
+          echo "good verify token -> $body"
+          [ "$body" = "echo-me" ] || { echo "handshake did not echo the challenge"; exit 1; }
+
+      - name: report
+        if: inputs.action == 'deploy'
+        run: |
+          aws cloudformation describe-stacks --stack-name ${PREFIX}-whatsapp --query 'Stacks[0].Outputs' --output table
+          {
+            echo "## WhatsApp channel deployed"
+            echo
+            echo "Set the callback URL in the Meta app dashboard to the WebhookUrl above,"
+            echo "with the verify token from SSM at /${PREFIX}/whatsapp/verify-token."
+          } >> "$GITHUB_STEP_SUMMARY"

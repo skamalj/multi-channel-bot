@@ -120,6 +120,10 @@ Resources:
                   - bedrock-agentcore:*
                   # The Gateway's JWT issuer (D-1).
                   - cognito-idp:*
+                  # The WhatsApp channel: queues, and the alarms that say a
+                  # customer asked something and got nothing back.
+                  - sqs:*
+                  - cloudwatch:*
                   - application-autoscaling:*
                   - tag:*
                 Resource: '*'
@@ -374,6 +378,7 @@ Resources:
                   - cognito-idp:ListUserPools
                   - ec2:DescribeVpcs
                   - ec2:DescribeVpcEndpoints
+                  - sqs:ListQueues
                 Resource: '*'
       Tags:
         - { Key: Project, Value: !Ref Prefix }
