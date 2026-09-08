@@ -385,3 +385,37 @@ def test_reads_are_strongly_consistent():
 
     for fn in (DynamoDBSaver._get, DynamoDBSaver._query_prefix):
         assert "ConsistentRead" in inspect.getsource(fn), fn.__name__
+
+
+def test_a_parked_confirmation_does_not_swallow_the_conversation():
+    """Found by replaying a real transcript against the deployed runtime.
+
+    While a confirmation was parked, every message was read ONLY as an answer
+    to it. "What is copayment?" came back as "I am about to create a health
+    quote - shall I go ahead?", and so did the question after that. The
+    customer could not change the subject until they said yes, said no, or
+    waited out the 30-minute expiry.
+
+    An unclear answer now carries on to the model, and the confirmation stays
+    parked so yes still works afterwards.
+    """
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from app.agents.graph import agent_for
+    from app.agents.registry import BOT_05
+
+    agent = agent_for(BOT_05)
+
+    # The customer asked something else entirely.
+    asked_something_else = {"messages": [HumanMessage(content="what is "
+                                                              "copayment?")]}
+    assert agent._after_pending(asked_something_else) == "model"
+
+    # They said yes, the tool ran, and the model speaks to the result.
+    confirmed = {"messages": [ToolMessage(content="{}", tool_call_id="t")]}
+    assert agent._after_pending(confirmed) == "model"
+
+    # They declined; that is already answered and the turn is over.
+    declined = {"messages": [AIMessage(content="No problem - I have not "
+                                               "done that.")]}
+    assert agent._after_pending(declined) == "end"

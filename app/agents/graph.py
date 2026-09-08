@@ -166,7 +166,20 @@ class Agent:
                         "No problem - I have not done that. What would you "
                         "like to do instead?")]}
         if answer == "unclear":
-            return {"messages": [_system_msg(pending["summary"])]}
+            # The customer said something that is not yes and not no - which
+            # usually means they asked something else. Let the turn carry on
+            # to the model, and leave the confirmation parked so they can
+            # still say yes afterwards.
+            #
+            # This used to answer with the confirmation prompt again and end
+            # the turn. Every message was then read ONLY as an answer to the
+            # pending question, so "what is copayment?" came back as "I am
+            # about to create a health quote - shall I go ahead?", and so did
+            # the next question, and the next. The customer could not change
+            # the subject until they said yes, said no, or waited out the
+            # 30-minute expiry. A confirmation is a question the bot asked;
+            # it is not permission to stop listening.
+            return {}
 
         # The token IS the idempotency key: the same operation confirmed
         # twice returns the first result rather than writing again.
@@ -192,8 +205,18 @@ class Agent:
         }
 
     def _after_pending(self, state: BotState) -> str:
+        """Where a confirmation turn goes next.
+
+        A ToolMessage means the customer said yes and the tool ran - the
+        model speaks to the result. A human message still being last means
+        the answer was unclear and nothing was written, so the turn carries
+        on as an ordinary one. Anything else is the decline, which is already
+        answered.
+        """
         last = state["messages"][-1]
-        return "model" if isinstance(last, ToolMessage) else "end"
+        if isinstance(last, ToolMessage):
+            return "model"
+        return "model" if getattr(last, "type", "") == "human" else "end"
 
     def _model(self, state: BotState, config) -> dict:
         cfg = settings()
