@@ -162,22 +162,30 @@ Resources:
             Examples:
               - Can I sue you if the claim is rejected?
               - What should I say to the police about the accident?
-          # The exclusion in the second sentence is load-bearing. Worded as
-          # "comparing Protec products to a competitor", the classifier
-          # blocked an answer listing Protec's OWN health products side by
-          # side - a customer asking which plan suits them got
-          # "I could not give you a reliable answer to that". Examples here
-          # are POSITIVE examples of the topic, so an allowed case cannot be
-          # demonstrated among them; it has to be excluded in the definition.
-          - Name: CompetitorDisparagement
-            Type: DENY
-            Definition: >-
-              Comparing Protec to a named rival insurer, or commenting on
-              another insurer's finances, service or claims record. Comparing
-              Protec's own products with each other is not this topic.
-            Examples:
-              - Is your policy better than the one from the other insurer?
-              - Do they reject more claims than you do?
+          # There is no CompetitorDisparagement topic here any more, and
+          # taking it out was a judgement about false positives, so the
+          # measurements are worth keeping. ApplyGuardrail, 5 runs each,
+          # against the OUTPUT side:
+          #
+          #   "I will search for information about Health Secure in our
+          #    approved sources."                          BLOCKED 5/5
+          #   "Let me look that up in our approved sources."   clean 5/5
+          #   "Protec Health Secure covers hospitalisation
+          #    after a 30-day waiting period."                clean 5/5
+          #   "Our claims record is better than Star Health
+          #    and they reject more claims."               BLOCKED 5/5
+          #
+          # It blocked the bot narrating its own search - deterministically,
+          # and the customer saw the block message with nothing wrong having
+          # happened. It also blocked the sales objection pack, whose section
+          # 10.1 is "It is cheaper elsewhere", which is corpus content the
+          # producer bot is meant to use.
+          #
+          # What it caught correctly is already caught twice over: a claim
+          # about a rival's claims record has no supporting passage, so the
+          # verifier drops the sentence and the citation rule refuses the
+          # turn. Two controls that read the actual answer beat one that
+          # fires on the word "Health Secure".
 
       # PII is where an insurance bot needs care. It legitimately handles the
       # customer's own name, phone number and policy references - masking
