@@ -184,20 +184,46 @@ dropped    : sentences the passages did not support
 invented_refs : numbers the model cited that were never sent
 ```
 
+A real example from testing. Asked about the maternity waiting period, the
+bot answered correctly and then added:
+
+> *If you're planning to start a family soon and need maternity coverage
+> sooner, you might want to consider the Maternity add-on (MAT)…*
+
+That add-on exists in the catalogue, but nothing in any document says it
+shortens the 36-month wait - it is a cover option with a rate. The sentence
+was dropped and the rest of the answer stood. Worth looking for: `dropped`
+is where you see the bot being stopped from inventing something helpful.
+
+`guardrail/outbound` appears only when Bedrock stopped the answer itself, and
+names the policy:
+
+```
+guardrail/outbound  { action: GUARDRAIL_INTERVENED,
+                      reasons: ["topic:CompetitorDisparagement"],
+                      blocked: true, round: 2 }
+```
+
+If you get *"I could not give you a reliable answer to that"* **with no
+`guardrail/outbound` beside it**, that is not the guardrail - report it.
+
 **If `verifier` is anything other than `ran`, the check did not happen.** The
 turn still proceeds - it degrades rather than refusing everything - but the
 answer had less scrutiny than it looks. That is worth reporting.
 
 `guardrail/grounding` now says `alarm` and `enforced: false`. A score below
-threshold is recorded, not blocked. Two correct answers to the same question
-scored 0.3 and 0.72 on consecutive runs, which is exactly why it is not
-allowed to decide anything.
+threshold is recorded, not blocked. Correct, properly cited answers to the
+same question have scored 0.3, 0.72 and 0.21 across runs, which is exactly
+why it is not allowed to decide anything.
 
 ## 5. Still rough
 
-**Bedrock's topic classifier misses some phrasings** even when given an exact
-matching example. A medical question worded unusually may get through to the
-model; the answer should still refuse for lack of a source.
+**Bedrock's topic classifier is imprecise in both directions.** A medical
+question worded unusually may get through to the model - the answer should
+still refuse for lack of a source. It also over-fires: it blocked an answer
+listing Protec's own plans as a competitor comparison, which is fixed, but
+the same shape of mistake could appear on another topic. If a plain question
+gets refused, open `guardrail/outbound` and note which policy fired.
 
 **WhatsApp is unexercised.** It needs Meta credentials that do not exist yet.
 
