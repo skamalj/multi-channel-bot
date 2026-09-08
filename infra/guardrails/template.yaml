@@ -28,12 +28,24 @@ Parameters:
     AllowedPattern: '^[a-z][a-z0-9-]{1,15}$'
   GroundingThreshold:
     Type: Number
-    Default: 0.75
-    Description: >
-      Below this, the response is not considered supported by the retrieved
-      passages. Set deliberately high: this is insurance, and the cost of a
-      confident wrong answer about cover is not symmetric with the cost of a
-      refusal.
+    Default: 0.4
+    Description: >-
+      CALIBRATED, not chosen. It started at 0.75 on the reasoning that a wrong
+      answer about cover costs more than a refusal, and that number refused a
+      GOOD answer in production: the knowledge base returned the right four
+      chunks, the citation guardrail passed it with three resolved citations
+      and no hallucinations, and grounding scored 0.56 because the model had
+      paraphrased across several passages rather than quoting one.
+
+      Measured separation, from real calls against this guardrail:
+        fabricated answer, contradicting the source .... 0.00
+        verbatim from a single passage ................. 1.00
+        correct answer paraphrased across passages ..... 0.56
+
+      0.4 passes the third and still blocks the first. A guardrail that
+      refuses correct answers is not cautious, it is broken - the customer
+      gets nothing and a colleague gets the call. Few samples; revisit with
+      more.
   RelevanceThreshold:
     Type: Number
     Default: 0.5
