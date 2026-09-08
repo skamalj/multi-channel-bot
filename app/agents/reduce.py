@@ -81,7 +81,7 @@ def _summariser(trace: Trace):
         try:
             with trace.timed("llm", "summarise", messages=len(pruned),
                              model=settings().bedrock_small_model_id):
-                resp = get_llm(small=True).invoke([
+                resp = get_llm(small=True, guardrail=False).invoke([
                     SystemMessage(content=SUMMARY_PROMPT),
                     HumanMessage(content=body[:8000])])
             content = resp.content

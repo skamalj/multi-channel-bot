@@ -101,12 +101,45 @@ def _client():
     return boto3.client("bedrock-runtime", region_name=settings().aws_region)
 
 
-def _assessment(resp: dict) -> GuardrailVerdict:
-    action = resp.get("action", "NONE")
+def intervention(response: Any) -> GuardrailVerdict:
+    """Why the model-level guardrail stopped a response.
+
+    `intervened()` says THAT it fired; this says which policy. Without it a
+    blocked answer reaches the customer as Bedrock's block message with an
+    empty trace beside it - the reply looks like a refusal the bot chose,
+    and the glass box cannot say otherwise. A guardrail that cannot be seen
+    working cannot be tuned when it fires on an ordinary question.
+
+    The assessment travels in `response_metadata["trace"]["guardrail"]`,
+    keyed by guardrail id under `outputAssessments`. Shapes vary between
+    model providers, so this walks whatever it finds rather than indexing.
+    """
+    meta = getattr(response, "response_metadata", None) or {}
+    blocked = meta.get("stopReason") == INTERVENED
+    guard = ((meta.get("trace") or {}).get("guardrail") or {})
+
+    found: list[dict] = []
+    for key in ("outputAssessments", "inputAssessment", "inputAssessments"):
+        section = guard.get(key)
+        if isinstance(section, dict):
+            for v in section.values():
+                found.extend(v if isinstance(v, list) else [v])
+        elif isinstance(section, list):
+            found.extend(section)
+
+    reasons, _, _ = _reasons(found)
+    return GuardrailVerdict(
+        blocked=blocked,
+        action=INTERVENED.upper() if blocked else "NONE",
+        reasons=reasons)
+
+
+def _reasons(assessments: list) -> tuple[list[str], float | None, float | None]:
+    """Which policies blocked, and the two contextual-grounding scores."""
     reasons: list[str] = []
     grounding = relevance = None
 
-    for a in resp.get("assessments") or []:
+    for a in assessments or []:
         for f in (a.get("contentPolicy") or {}).get("filters") or []:
             if f.get("action") == "BLOCKED":
                 reasons.append(f"content:{f.get('type', '?').lower()}")
@@ -133,6 +166,13 @@ def _assessment(resp: dict) -> GuardrailVerdict:
                 relevance = g.get("score")
             if g.get("action") == "BLOCKED":
                 reasons.append(f"grounding:{g.get('type', '?').lower()}")
+
+    return reasons, grounding, relevance
+
+
+def _assessment(resp: dict) -> GuardrailVerdict:
+    action = resp.get("action", "NONE")
+    reasons, grounding, relevance = _reasons(resp.get("assessments") or [])
 
     text = None
     outputs = resp.get("outputs") or []

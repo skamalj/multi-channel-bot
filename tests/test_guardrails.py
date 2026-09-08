@@ -271,7 +271,7 @@ def verdict_json(monkeypatch):
             def invoke(self, _messages):
                 return _Msg()
 
-        monkeypatch.setattr(bedrock, "get_llm", lambda small=False: _LLM())
+        monkeypatch.setattr(bedrock, "get_llm", lambda *a, **k: _LLM())
         monkeypatch.setattr(verify, "configured", lambda: True)
     return _set
 
@@ -310,3 +310,67 @@ def test_a_reply_that_is_not_json_is_a_failed_check_not_a_pass(verdict_json):
     verdict_json("I could not determine that.")
     v = verify.check(ANSWER, CHUNKS)
     assert v.ran is False and v.error == "unparseable_verdict"
+
+
+# ---------------------------------------------------------------------------
+# a blocked completion must be visible
+# ---------------------------------------------------------------------------
+def test_a_blocked_completion_names_the_policy_that_stopped_it():
+    """Bedrock returns the block message as the model's own words rather than
+    raising, so a blocked answer looked exactly like a chosen refusal. The
+    helper for this existed and was never called from anywhere."""
+    from langchain_core.messages import AIMessage
+
+    from app.agents import guardrail
+
+    ai = AIMessage(content="I could not give you a reliable answer to that.",
+                   response_metadata={
+                       "stopReason": "guardrail_intervened",
+                       "trace": {"guardrail": {"outputAssessments": {"gr-1": [
+                           {"topicPolicy": {"topics": [
+                               {"name": "medical_advice", "action": "BLOCKED"}]},
+                            "contentPolicy": {"filters": [
+                                {"type": "MISCONDUCT", "action": "NONE"}]}}]}}}})
+
+    assert guardrail.intervened(ai) is True
+    v = guardrail.intervention(ai)
+    assert v.blocked is True
+    assert v.reasons == ["topic:medical_advice"]
+
+
+def test_an_ordinary_completion_is_not_read_as_an_intervention():
+    from langchain_core.messages import AIMessage
+
+    from app.agents import guardrail
+
+    ai = AIMessage(content="Maternity is covered after 36 months [1].",
+                   response_metadata={"stopReason": "end_turn"})
+    assert guardrail.intervened(ai) is False
+    assert guardrail.intervention(ai).blocked is False
+
+
+def test_the_internal_checks_do_not_carry_the_customer_guardrail(monkeypatch):
+    """A guardrail on the verifier's own call replaces its JSON with the block
+    message, so the check silently does not happen - which is what
+    `unparseable_verdict` meant on a live turn."""
+    from app.llm import bedrock
+
+    seen: list[bool] = []
+
+    class _Chat:
+        def __init__(self, **kw):
+            seen.append("guardrail_config" in kw)
+
+    monkeypatch.setattr(bedrock, "settings",
+                        lambda: type("C", (), {
+                            "mock_llm": False, "aws_region": "ap-south-1",
+                            "llm_temperature": 0.0, "llm_max_tokens": 100,
+                            "bedrock_model_id": "m", "bedrock_small_model_id": "s",
+                        })())
+    monkeypatch.setattr("langchain_aws.ChatBedrockConverse", _Chat)
+    monkeypatch.setattr("app.agents.guardrail.model_config",
+                        lambda: {"guardrailIdentifier": "gr-1"})
+
+    bedrock.get_llm()                       # the customer-facing call
+    bedrock.get_llm(guardrail=False)        # an internal check
+    assert seen == [True, False]

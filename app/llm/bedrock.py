@@ -135,7 +135,25 @@ class StubLLM:
 # ---------------------------------------------------------------------------
 # Bedrock
 # ---------------------------------------------------------------------------
-def get_llm(small: bool = False):
+def get_llm(small: bool = False, guardrail: bool = True):
+    """The model. `guardrail=False` is for calls a customer never reads.
+
+    The guardrail exists to protect what a customer sees, and it belongs on
+    the call that writes to them. It does not belong on the internal calls
+    that decide things ABOUT that answer - the claim verifier, the thread
+    summariser, the intent classifier, the reranker. Every one of those reads
+    the model's reply back as JSON, and an intervention does not raise: it
+    replaces the reply with the block message. So the JSON fails to parse and
+    the check silently does not happen.
+
+    That was not hypothetical. The verifier returned `unparseable_verdict` on
+    a live turn because the guardrail intervened on the VERIFIER's own call -
+    the one deciding whether the answer was safe to send. A safety control
+    that disables the safety machinery is worse than not having it there.
+
+    Nothing is weakened by this: the customer-facing generation still carries
+    it, and so does the inbound screen, which is where untrusted text arrives.
+    """
     cfg = settings()
     if cfg.mock_llm:
         return StubLLM()
@@ -151,10 +169,10 @@ def get_llm(small: bool = False):
     )
     # The guardrail rides on the Converse call itself. When it intervenes the
     # response carries stopReason == "guardrail_intervened" rather than
-    # raising, so callers check `guardrail.intervened(resp)` - see the respond
+    # raising, so callers check `guardrail.intervened(resp)` - see the model
     # node. None here means no guardrail is deployed, which is the offline
     # posture, not a silent opt-out.
-    gc = model_config()
+    gc = model_config() if guardrail else None
     if gc:
         kwargs["guardrail_config"] = gc
     return ChatBedrockConverse(**kwargs)
@@ -202,7 +220,7 @@ def classify_lob(text: str, options: list[str]) -> tuple[str | None, float, str]
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = get_llm(small=True)
+        llm = get_llm(small=True, guardrail=False)
         resp = llm.invoke([
             SystemMessage(content=_INTENT_PROMPT.format(
                 options=", ".join(f'"{o}"' for o in options))),
@@ -235,7 +253,7 @@ def score_relevance(query: str, passages: list[dict]) -> dict[str, float]:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     body = "\n\n".join(f"[{p['chunk_id']}] {p['text']}" for p in passages)
-    resp = get_llm(small=True).invoke([
+    resp = get_llm(small=True, guardrail=False).invoke([
         SystemMessage(content=_RERANK_PROMPT),
         HumanMessage(content=f"Question: {query}\n\nPassages:\n{body}"),
     ])

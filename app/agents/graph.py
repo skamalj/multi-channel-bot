@@ -216,6 +216,19 @@ class Agent:
                          model="stub" if cfg.mock_llm else cfg.bedrock_model_id,
                          tools_bound=len(self.tool_names)):
             ai: AIMessage = self.llm.invoke(messages)
+
+        # A blocked completion does not raise. Bedrock returns the block
+        # message as the model's own words, so without this the customer gets
+        # a refusal and the glass box shows an ordinary turn beside it - the
+        # reply reads as something the bot decided rather than something the
+        # guardrail stopped. `intervened` was defined for this and never
+        # called anywhere, which is how that went unnoticed.
+        if guardrail.intervened(ai):
+            v = guardrail.intervention(ai)
+            trace.add("guardrail", "outbound", action=v.action,
+                      reasons=v.reasons, blocked=True,
+                      round=state.get("rounds", 0) + 1)
+
         return {"messages": [ai], "rounds": state.get("rounds", 0) + 1}
 
     def _after_model(self, state: BotState) -> str:
