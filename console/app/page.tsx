@@ -1,25 +1,34 @@
 "use client";
 
 /**
- * The console: CopilotKit's chat on the left, the glass box on the right.
+ * The console: assistant-ui chat on the left, the glass box on the right.
  *
- * THE THREAD IS THE PERSON, and that is not decoration - the whole memory
- * design rests on it. `threadId` becomes the resolver thread (ME-1) and,
- * with the line of business appended, the bot thread (ME-2). Left to itself
- * CopilotKit mints a fresh UUID per run, so consecutive turns landed on
- * different threads and the agent could not remember the previous sentence.
+ * WHY THE EXTERNAL-STORE RUNTIME. This build's whole point is the glass box,
+ * and an abstraction that owns the transport hides the event stream from you.
+ * With `useExternalStoreRuntime` the browser makes the request and reads the
+ * SSE itself, so every AG-UI event is in hand: the answer goes to the chat,
+ * and the CUSTOM trace events go to the panel, from ONE parse of ONE stream.
  *
- * So the provider is prop-controlled here: the customer identity is chosen in
- * the UI, persisted, and passed as `threadId`. Switch identity and you are a
- * different person to the agent, with a different history - which is the
- * behaviour worth demonstrating.
+ * That is not a stylistic preference. The previous runtime did not forward
+ * CUSTOM events to subscribers at all, so the trace had to be polled from a
+ * side-channel after the turn - the events were real but the liveness was
+ * theatre. Here they arrive as they arrive.
+ *
+ * THE THREAD IS THE PERSON. `threadId` is the identity chosen below, which
+ * becomes the resolver thread (ME-1) and, with the line of business appended,
+ * the bot thread (ME-2). Nothing generates one on our behalf, so nothing can
+ * silently give each turn a new conversation.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  CopilotChat,
-  CopilotKitProvider,
-  useAgent,
-} from "@copilotkit/react-core/v2";
+  AssistantRuntimeProvider,
+  ComposerPrimitive,
+  MessagePrimitive,
+  ThreadPrimitive,
+  useExternalStoreRuntime,
+  type AppendMessage,
+  type ThreadMessageLike,
+} from "@assistant-ui/react";
 
 type TraceEvent = {
   kind: string;
@@ -27,10 +36,11 @@ type TraceEvent = {
   detail?: Record<string, unknown>;
 };
 
+type Msg = { id: string; role: "user" | "assistant"; text: string };
 type Mode = { mode: "remote" | "local"; runtime_arn: string | null };
 
 // The seeded customers and producer from the core store. A phone number is
-// what a WhatsApp message would arrive with, so it is what the console uses.
+// what a WhatsApp message arrives with, so it is what the console uses.
 const IDENTITIES = [
   { id: "919820000009", label: "Priya Sharma - health + motor" },
   { id: "919820000002", label: "Rohit Verma - senior health" },
@@ -38,11 +48,12 @@ const IDENTITIES = [
   { id: "919820000001", label: "Rakesh Nair - producer" },
 ];
 
+const AGUI = "/api/agui";
+
 export default function Page() {
-  const [userId, setUserId] = useState<string>(IDENTITIES[0].id);
+  const [userId, setUserId] = useState(IDENTITIES[0].id);
   const [ready, setReady] = useState(false);
 
-  // Restored so a reload does not silently become a different customer.
   useEffect(() => {
     const saved = window.localStorage.getItem("mcb.userId");
     if (saved) setUserId(saved);
@@ -54,24 +65,9 @@ export default function Page() {
   }, [userId, ready]);
 
   if (!ready) return null;
-
-  return (
-    <CopilotKitProvider
-      runtimeUrl="/api/copilotkit"
-      agent="protec"
-      threadId={userId}
-      // The header is what actually reaches the agent. CopilotKit's threadId
-      // governs its own transcript; the AG-UI payload it sends onward
-      // carries an internal UUID, so the identity is stated explicitly.
-      headers={{ "x-mcb-user": userId }}
-      // Remounted on change so the transcript belongs to the identity it was
-      // produced under, rather than one person's history appearing to be
-      // another's.
-      key={userId}
-    >
-      <Console userId={userId} onUserChange={setUserId} />
-    </CopilotKitProvider>
-  );
+  // Remounted per identity: one person's transcript must never appear to be
+  // another's.
+  return <Console key={userId} userId={userId} onUserChange={setUserId} />;
 }
 
 function Console({
@@ -81,14 +77,12 @@ function Console({
   userId: string;
   onUserChange: (id: string) => void;
 }) {
-  const { agent } = useAgent({ agentId: "protec" });
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [events, setEvents] = useState<TraceEvent[]>([]);
+  const [running, setRunning] = useState(false);
   const [mode, setMode] = useState<Mode | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
 
-  // Which agent is actually answering. A console that quietly ran the agent
-  // in-process would look identical to one driving the deployment and would
-  // prove nothing, so it says which.
   useEffect(() => {
     fetch("/api/mode")
       .then((r) => r.json())
@@ -96,88 +90,245 @@ function Console({
       .catch(() => setMode(null));
   }, []);
 
-  // CopilotKit does not forward AG-UI CUSTOM events to a subscriber, so the
-  // trace is read from the bridge, which kept what it produced. The events
-  // and their order are the real ones; only the liveness is not - they land
-  // when the turn ends rather than as it runs.
-  //
-  // Keyed by identity now that the thread is stable, so switching customer
-  // shows that customer's last turn rather than whoever happened to go last.
-  useEffect(() => {
-    let stop = false;
-    const tick = async () => {
-      try {
-        const r = await fetch(`/api/trace/${encodeURIComponent(userId)}`, {
-          cache: "no-store",
-        });
-        const body = await r.json();
-        if (!stop && Array.isArray(body.events)) {
-          setEvents(body.events as TraceEvent[]);
-        }
-      } catch {
-        /* the bridge is not up; the chat will say so on its own */
-      }
-    };
-    tick();
-    const id = setInterval(tick, 1500);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
-  }, [userId, agent]);
-
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
-  }, [events]);
+  }, [events, messages]);
+
+  const onNew = useCallback(
+    async (message: AppendMessage) => {
+      const text = message.content
+        .map((p) => (p.type === "text" ? p.text : ""))
+        .join("")
+        .trim();
+      if (!text) return;
+
+      const userMsg: Msg = { id: crypto.randomUUID(), role: "user", text };
+      const assistantId = crypto.randomUUID();
+      setMessages((m) => [...m, userMsg]);
+      // A new turn starts a new trace. Keeping the previous turn's events
+      // would make it look as though this answer consulted documents it
+      // never touched.
+      setEvents([]);
+      setRunning(true);
+
+      try {
+        const res = await fetch(AGUI, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            threadId: userId,
+            runId: userMsg.id,
+            messages: [{ id: userMsg.id, role: "user", content: text }],
+            state: {},
+            tools: [],
+            context: [],
+            forwardedProps: { channel: "webchat" },
+          }),
+        });
+        if (!res.body) throw new Error("no response body");
+
+        // Parse the SSE ourselves. Frames are separated by a blank line and a
+        // frame can be split across reads, so the tail is carried over rather
+        // than assuming one chunk is one event.
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let answered = false;
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let cut: number;
+          while ((cut = buffer.indexOf("\n\n")) !== -1) {
+            const frame = buffer.slice(0, cut);
+            buffer = buffer.slice(cut + 2);
+            for (const line of frame.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              let ev: any;
+              try {
+                ev = JSON.parse(line.slice(5).trim());
+              } catch {
+                continue;
+              }
+              handle(ev);
+            }
+          }
+        }
+
+        function handle(ev: any) {
+          switch (ev.type) {
+            case "CUSTOM":
+              if (ev.name === "trace" && ev.value) {
+                setEvents((prev) => [...prev, ev.value as TraceEvent]);
+              }
+              break;
+            case "TOOL_CALL_START":
+              setEvents((prev) => [
+                ...prev,
+                { kind: "tool", label: String(ev.toolCallName ?? "") },
+              ]);
+              break;
+            case "TEXT_MESSAGE_CONTENT":
+              answered = true;
+              setMessages((m) => {
+                const has = m.some((x) => x.id === assistantId);
+                if (!has) {
+                  return [
+                    ...m,
+                    { id: assistantId, role: "assistant", text: ev.delta ?? "" },
+                  ];
+                }
+                return m.map((x) =>
+                  x.id === assistantId ? { ...x, text: x.text + (ev.delta ?? "") } : x,
+                );
+              });
+              break;
+            case "RUN_ERROR":
+              setEvents((prev) => [
+                ...prev,
+                {
+                  kind: "error",
+                  label: String(ev.code ?? "RUN_ERROR"),
+                  detail: { message: ev.message },
+                },
+              ]);
+              break;
+          }
+        }
+
+        if (!answered) {
+          setMessages((m) => [
+            ...m,
+            {
+              id: assistantId,
+              role: "assistant",
+              text: "(the agent produced no reply for this turn)",
+            },
+          ]);
+        }
+      } catch (err) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: assistantId,
+            role: "assistant",
+            text: `Could not reach the agent: ${String(err)}`,
+          },
+        ]);
+      } finally {
+        setRunning(false);
+      }
+    },
+    [userId],
+  );
+
+  const runtime = useExternalStoreRuntime<Msg>({
+    messages,
+    isRunning: running,
+    setMessages,
+    onNew,
+    convertMessage: (m): ThreadMessageLike => ({
+      role: m.role,
+      content: [{ type: "text", text: m.text }],
+      id: m.id,
+    }),
+  });
 
   return (
-    <div className="shell">
-      <div className="chat">
-        <CopilotChat />
+    <AssistantRuntimeProvider runtime={runtime}>
+      <div className="shell">
+        <div className="chat">
+          <ThreadPrimitive.Root className="thread">
+            <ThreadPrimitive.Viewport className="viewport">
+              <ThreadPrimitive.Empty>
+                <div className="empty">
+                  <h1>Protec</h1>
+                  <p>
+                    Ask about cover, a policy, a quote or a claim. Everything
+                    the agent does appears on the right.
+                  </p>
+                </div>
+              </ThreadPrimitive.Empty>
+
+              <ThreadPrimitive.Messages
+                components={{
+                  UserMessage: () => (
+                    <div className="msg user">
+                      <MessagePrimitive.Parts />
+                    </div>
+                  ),
+                  AssistantMessage: () => (
+                    <div className="msg assistant">
+                      <MessagePrimitive.Parts />
+                    </div>
+                  ),
+                }}
+              />
+
+              {running && <div className="thinking">working…</div>}
+              <div ref={bottom} />
+            </ThreadPrimitive.Viewport>
+
+            <ComposerPrimitive.Root className="composer">
+              <ComposerPrimitive.Input
+                className="composer-input"
+                placeholder="Ask about your cover…"
+                autoFocus
+              />
+              <ComposerPrimitive.Send className="composer-send">
+                Send
+              </ComposerPrimitive.Send>
+            </ComposerPrimitive.Root>
+          </ThreadPrimitive.Root>
+        </div>
+
+        <aside className="glass">
+          <h2>Glass box</h2>
+          <p className="sub">Every AG-UI event this turn produced, in order.</p>
+
+          <label className="who">
+            <span>speaking as</span>
+            <select
+              value={userId}
+              onChange={(e) => onUserChange(e.target.value)}
+            >
+              {IDENTITIES.map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="sub">
+            thread <code>{userId}</code> - the resolver thread, and with the
+            line of business appended, the bot thread.
+          </p>
+
+          {mode && (
+            <span className={`mode ${mode.mode}`}>
+              {mode.mode === "remote"
+                ? "answering from the deployed AgentCore Runtime"
+                : "answering in-process (no runtime ARN set)"}
+            </span>
+          )}
+
+          {events.length === 0 && (
+            <p className="sub">Ask something to see the agent work.</p>
+          )}
+
+          {events.map((e, i) => (
+            <div key={i} className={`ev ${e.kind}`}>
+              <span className="k">{e.kind}</span>{" "}
+              <span className="l">{e.label}</span>
+              {e.detail && Object.keys(e.detail).length > 0 && (
+                <div className="d">{JSON.stringify(e.detail, null, 1)}</div>
+              )}
+            </div>
+          ))}
+        </aside>
       </div>
-
-      <aside className="glass">
-        <h2>Glass box</h2>
-        <p className="sub">Every AG-UI event this turn produced, in order.</p>
-
-        <label className="who">
-          <span>speaking as</span>
-          <select value={userId} onChange={(e) => onUserChange(e.target.value)}>
-            {IDENTITIES.map((i) => (
-              <option key={i.id} value={i.id}>
-                {i.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <p className="sub">
-          thread <code>{userId}</code> - the resolver thread, and with the line
-          of business appended, the bot thread.
-        </p>
-
-        {mode && (
-          <span className={`mode ${mode.mode}`}>
-            {mode.mode === "remote"
-              ? "answering from the deployed AgentCore Runtime"
-              : "answering in-process (no runtime ARN set)"}
-          </span>
-        )}
-
-        {events.length === 0 && (
-          <p className="sub">Ask something to see the agent work.</p>
-        )}
-
-        {events.map((e, i) => (
-          <div key={i} className={`ev ${e.kind}`}>
-            <span className="k">{e.kind}</span>{" "}
-            <span className="l">{e.label}</span>
-            {e.detail && Object.keys(e.detail).length > 0 && (
-              <div className="d">{JSON.stringify(e.detail, null, 1)}</div>
-            )}
-          </div>
-        ))}
-        <div ref={bottom} />
-      </aside>
-    </div>
+    </AssistantRuntimeProvider>
   );
 }

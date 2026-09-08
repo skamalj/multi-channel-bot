@@ -275,36 +275,6 @@ def _proxy_to_runtime(payload: dict, cfg):
         yield chunk.decode() if isinstance(chunk, (bytes, bytearray)) else chunk
 
 
-# The last turn's trace, per thread.
-#
-# The glass box needs these and CopilotKit's client does not forward AG-UI
-# CUSTOM events to a subscriber - the chat renders, the trace never arrives.
-# Rather than keep guessing at another library's internals, the bridge keeps
-# what it already produced and the console asks for it.
-#
-# Honest about what this is: the trace is FETCHED after the turn rather than
-# streamed during it. The events and their order are the real ones; the
-# liveness is not. Bounded per thread so a long conversation cannot grow it
-# without limit.
-_LAST_TRACE: dict[str, list] = {}
-_TRACE_THREADS = 32
-
-
-def _remember_trace(thread: str, events: list) -> None:
-    if len(_LAST_TRACE) >= _TRACE_THREADS and thread not in _LAST_TRACE:
-        _LAST_TRACE.pop(next(iter(_LAST_TRACE)), None)
-    _LAST_TRACE[thread] = events
-    # Kept as a fallback for any client that has no stable thread of its own.
-    # The console no longer needs it - CopilotKitProvider takes a threadId
-    # prop, so the identity chosen in the UI IS the thread.
-    _LAST_TRACE["__last"] = events
-
-
-@app.get("/api/agui/trace/{thread}")
-def agui_trace(thread: str) -> dict:
-    return {"thread": thread, "events": _LAST_TRACE.get(thread, [])}
-
-
 @app.get("/api/agui/mode")
 def agui_mode() -> dict:
     """Which agent the console is actually talking to.

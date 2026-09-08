@@ -160,16 +160,6 @@ async def run(payload: dict):
     message_id = uuid.uuid4().hex
     events = trace_events(trace, message_id)
 
-    # Kept so the console can render the glass box; see app/main.py.
-    try:
-        from app import main as _console
-
-        _console._remember_trace(thread_id, [
-            e["value"] for e in events
-            if e.get("type") == "CUSTOM" and e.get("name") == "trace"])
-    except Exception:                                        # noqa: BLE001
-        pass
-
     for ev in events:
         yield ev
 
