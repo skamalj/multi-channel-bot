@@ -219,11 +219,14 @@ Resources:
         - SSMParameterReadPolicy:
             ParameterName: !Sub "${Prefix}/whatsapp/*"
         - Statement:
+            # Cross-region inference profile: the foundation model must be
+            # allowed in every region the profile can route to. See the same
+            # note in infra/agent/template.yaml.
             - Effect: Allow
               Action: bedrock:InvokeModel
               Resource:
-                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
-                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
             - Effect: Allow
               Action: bedrock:ApplyGuardrail
               Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"

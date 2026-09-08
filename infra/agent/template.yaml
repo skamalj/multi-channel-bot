@@ -90,14 +90,21 @@ Resources:
               # Inference. Scoped to the two models this build uses plus the
               # inference profiles that front them - a wildcard here would let
               # a prompt-injected agent reach any model in the account.
+              # A CROSS-REGION inference profile needs the foundation model
+              # in EVERY region it can route to, not just this one.
+              # `apac.amazon.nova-lite-v1:0` fans out to six APAC regions, so
+              # granting only ap-south-1 denied roughly five calls in six -
+              # silently, because the verifier and the summariser both fail
+              # open. The trace said `verifier: AccessDeniedException` and
+              # the answers looked fine.
               - Sid: Inference
                 Effect: Allow
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
-                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
               - Sid: Retrieve
                 Effect: Allow
                 Action:
