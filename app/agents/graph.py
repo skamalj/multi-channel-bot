@@ -228,6 +228,14 @@ class Agent:
             trace.add("guardrail", "outbound", action=v.action,
                       reasons=v.reasons, blocked=True,
                       round=state.get("rounds", 0) + 1)
+            # Bedrock's block message is not the model's words, so it must not
+            # come back as the model's own prior turn. Left unmarked it does,
+            # and the model copies its own precedent: one blocked answer on
+            # this thread and every later turn repeated "I could not give you
+            # a reliable answer" - with nothing blocking it, because by then
+            # the model was simply writing what it had apparently said before.
+            # Same treatment as a confirmation prompt, for the same reason.
+            ai.additional_kwargs["system_authored"] = True
 
         return {"messages": [ai], "rounds": state.get("rounds", 0) + 1}
 

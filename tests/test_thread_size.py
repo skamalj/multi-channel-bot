@@ -237,3 +237,36 @@ def test_a_thread_that_does_not_divide_evenly_still_reaches_the_model_whole():
     orphans = [m.tool_call_id for m in sent
                if isinstance(m, ToolMessage) and m.tool_call_id not in call_ids]
     assert orphans == [], f"tool results with no call: {orphans}"
+
+
+def test_a_blocked_answer_is_not_replayed_as_the_models_own_words():
+    """Observed live: one blocked turn poisoned the whole thread.
+
+    Bedrock returns its block message as the assistant's content. Stored
+    unmarked, it came back on the next turn as the model's own prior answer -
+    so the model repeated "I could not give you a reliable answer" with
+    nothing blocking it, simply following its own apparent precedent. The
+    customer still sees it; the model must not learn from it.
+    """
+    from app.agents.graph import model_visible
+
+    agent = agent_for(BOT_05)
+
+    class _Blocked:
+        def invoke(self, _messages):
+            return AIMessage(
+                content="I could not give you a reliable answer to that.",
+                id="blocked",
+                response_metadata={"stopReason": "guardrail_intervened"})
+
+    original, agent.llm = agent.llm, _Blocked()
+    try:
+        out = agent._model({"messages": [HumanMessage(content="hi", id="h")],
+                            "rounds": 0},
+                           {"configurable": {"trace": Trace()}})
+    finally:
+        agent.llm = original
+
+    blocked = out["messages"][0]
+    assert blocked.additional_kwargs.get("system_authored") is True
+    assert model_visible([blocked]) == []
