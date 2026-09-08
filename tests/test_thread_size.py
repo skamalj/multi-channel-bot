@@ -270,3 +270,61 @@ def test_a_blocked_answer_is_not_replayed_as_the_models_own_words():
     blocked = out["messages"][0]
     assert blocked.additional_kwargs.get("system_authored") is True
     assert model_visible([blocked]) == []
+
+
+def test_a_block_message_already_in_a_thread_is_healed_not_just_prevented(monkeypatch):
+    """The fault this actually presented as.
+
+    Marking the message when the guardrail fires only covers the first one.
+    Bedrock returns the block message as the assistant's content, so once one
+    sits in the history unmarked the model writes it again as its own answer -
+    and that copy arrives with NO intervention to detect, so it is stored
+    unmarked too. The thread then refuses everything with an empty guardrail
+    trace beside it, which is how it looked on a live thread: four unmarked
+    copies, all visible to the model.
+
+    Matching the configured wording heals a thread already carrying them.
+    """
+    from app.agents import graph as G
+
+    message = ("I could not give you a reliable answer to that, so I would "
+               "rather not guess. Shall I put you through to a colleague who "
+               "can check it properly?")
+    monkeypatch.setattr(G, "settings", lambda: type(
+        "C", (), {"guardrail_blocked_message": message})())
+
+    history = [
+        HumanMessage(content="what is the maternity waiting period?", id="h1"),
+        AIMessage(content=message, id="a1"),          # no marker: the copy
+        HumanMessage(content="and for my wife?", id="h2"),
+        AIMessage(content="  I COULD not give you a reliable answer to that, "
+                          "so I would rather not guess. Shall I put you "
+                          "through to a colleague who can check it properly? ",
+                  id="a2"),                            # folded/cased variant
+        AIMessage(content="Maternity is covered after 36 months [1].", id="a3"),
+    ]
+
+    visible = G.model_visible(history)
+    assert [m.id for m in visible] == ["h1", "h2", "a3"]
+
+
+def test_an_ordinary_answer_is_not_mistaken_for_the_block_message(monkeypatch):
+    from app.agents import graph as G
+
+    monkeypatch.setattr(G, "settings", lambda: type(
+        "C", (), {"guardrail_blocked_message": "I could not give you a "
+                                               "reliable answer to that."})())
+    keep = AIMessage(content="I could not find that in the policy wording, "
+                             "but I can check with a colleague.", id="a1")
+    assert G.model_visible([keep]) == [keep]
+
+
+def test_with_no_guardrail_deployed_nothing_is_filtered_on_text(monkeypatch):
+    """Offline and in tests the message is empty, and an empty string must not
+    match every message."""
+    from app.agents import graph as G
+
+    monkeypatch.setattr(G, "settings", lambda: type(
+        "C", (), {"guardrail_blocked_message": ""})())
+    msgs = [AIMessage(content="", id="a1"), AIMessage(content="hello", id="a2")]
+    assert G.model_visible(msgs) == msgs

@@ -54,6 +54,14 @@ Parameters:
     Type: Number
     Default: 0.5
     Description: How related the response must be to what was actually asked.
+  BlockedOutputsMessage:
+    Type: String
+    Default: >-
+      I could not give you a reliable answer to that, so I would rather not
+      guess. Shall I put you through to a colleague who can check it properly?
+    Description: >-
+      What the customer sees when the guardrail stops an answer. Exported so
+      the agent can recognise it coming back as the model's own words.
   PolicyRevision:
     Type: String
     Default: manual
@@ -78,10 +86,14 @@ Resources:
       BlockedInputMessaging: >-
         I am not able to help with that here. If it is about your policy or a
         claim, I can put you through to a colleague who can.
-      BlockedOutputsMessaging: >-
-        I could not give you a reliable answer to that, so I would rather not
-        guess. Shall I put you through to a colleague who can check it
-        properly?
+      # A parameter rather than a literal, and exported below, because the
+      # agent has to be able to RECOGNISE this sentence. Bedrock returns it
+      # as the assistant's own content; stored that way it comes back as the
+      # model's prior answer and the model copies it - a thread that is
+      # blocked once then refuses everything, with nothing blocking it. Two
+      # copies of the wording would drift, and the day they drifted the agent
+      # would stop recognising it.
+      BlockedOutputsMessaging: !Ref BlockedOutputsMessage
 
       ContentPolicyConfig:
         FiltersConfig:
@@ -254,3 +266,9 @@ Outputs:
   GuardrailVersion:
     Value: !GetAtt GuardrailVersion.Version
     Export: { Name: !Sub "${Prefix}-guardrail-version" }
+  BlockedOutputsMessage:
+    Description: >-
+      The agent keeps this out of the model's own context. See the comment on
+      BlockedOutputsMessaging.
+    Value: !Ref BlockedOutputsMessage
+    Export: { Name: !Sub "${Prefix}-guardrail-blocked-message" }

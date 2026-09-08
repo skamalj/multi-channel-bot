@@ -19,6 +19,14 @@ Parameters:
   GuardrailVersion:
     Type: String
     Default: DRAFT
+  GuardrailBlockedMessage:
+    Type: String
+    Default: ''
+    Description: >-
+      What the guardrail says to the customer when it stops an answer. The
+      agent needs it in order to keep that sentence out of the model's own
+      context - Bedrock returns it as the assistant's content, and a model
+      shown its own apparent refusal will write it again unprompted.
   KnowledgeBaseId:
     Type: String
     Default: ''
@@ -196,6 +204,7 @@ Resources:
         S3_BUCKET: !Sub "${Prefix}-documents-${AWS::AccountId}"
         GUARDRAIL_ID: !Ref GuardrailId
         GUARDRAIL_VERSION: !Ref GuardrailVersion
+        GUARDRAIL_BLOCKED_MESSAGE: !Ref GuardrailBlockedMessage
         KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
         GATEWAY_URL: !Ref GatewayUrl
         SSM_PREFIX: !Sub "/${Prefix}"

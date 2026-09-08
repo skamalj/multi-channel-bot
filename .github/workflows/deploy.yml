@@ -225,6 +225,7 @@ jobs:
     outputs:
       id: ${{ steps.out.outputs.id }}
       version: ${{ steps.out.outputs.version }}
+      blocked_message: ${{ steps.out.outputs.blocked_message }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
@@ -258,6 +259,9 @@ jobs:
           q() { aws cloudformation describe-stacks --stack-name ${PREFIX}-guardrails --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
           echo "id=$(q GuardrailId)" >> "$GITHUB_OUTPUT"
           echo "version=$(q GuardrailVersion)" >> "$GITHUB_OUTPUT"
+          # The agent has to recognise this sentence coming back as the
+          # model's own words. Single line by construction, so no heredoc.
+          echo "blocked_message=$(q BlockedOutputsMessage)" >> "$GITHUB_OUTPUT"
           echo "guardrail $(q GuardrailId) version $(q GuardrailVersion)"
 
   # ------------------------------------------------------------------ tools
@@ -370,7 +374,7 @@ jobs:
 
       - name: deploy
         run: |
-          aws cloudformation deploy --template-file infra/agent/template.yaml --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Prefix=${PREFIX} ContainerUri="${{ steps.image.outputs.uri }}" GuardrailId="${{ needs.guardrails.outputs.id }}" GuardrailVersion="${{ needs.guardrails.outputs.version }}" KnowledgeBaseId="${{ needs.knowledge.outputs.kb_id }}" GatewayUrl="${{ needs.tools.outputs.gateway_url }}" --tags Project=${PREFIX} --no-fail-on-empty-changeset
+          aws cloudformation deploy --template-file infra/agent/template.yaml --stack-name ${PREFIX}-agent --role-arn ${{ vars.AWS_CFN_EXEC_ROLE_ARN }} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Prefix=${PREFIX} ContainerUri="${{ steps.image.outputs.uri }}" GuardrailId="${{ needs.guardrails.outputs.id }}" GuardrailVersion="${{ needs.guardrails.outputs.version }}" GuardrailBlockedMessage="${{ needs.guardrails.outputs.blocked_message }}" KnowledgeBaseId="${{ needs.knowledge.outputs.kb_id }}" GatewayUrl="${{ needs.tools.outputs.gateway_url }}" --tags Project=${PREFIX} --no-fail-on-empty-changeset
 
       - name: report
         run: |

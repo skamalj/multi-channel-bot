@@ -58,6 +58,10 @@ class Settings(BaseSettings):
 
     guardrail_id: str = ""
     guardrail_version: str = "DRAFT"
+    # Supplied by the guardrails stack, which owns the wording. Empty simply
+    # means the filter below has nothing to match, which is the offline
+    # posture - see model_visible in app/agents/graph.py.
+    guardrail_blocked_message: str = ""
 
     # Bedrock Knowledge Base. Empty falls back to the local corpus, which is
     # what the offline tests use.

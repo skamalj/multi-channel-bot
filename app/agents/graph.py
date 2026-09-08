@@ -572,11 +572,39 @@ def model_visible(messages) -> list:
     nothing is parked to confirm, and the journey stalls with the bot
     politely describing an action it never took.
 
+    The guardrail's block message is filtered on its TEXT as well as on the
+    marker, and that is not belt-and-braces - marking it when the guardrail
+    fires is not enough. Bedrock returns the block message as the assistant's
+    own content. Once one is in the history unmarked, the model reads it as
+    something it said and writes it again on the next turn - and that copy
+    arrives with no intervention to detect, so it is stored unmarked too. The
+    thread refuses everything from then on with nothing blocking it, which is
+    exactly how it presented: a block message and an empty guardrail trace.
+    Matching the text breaks the loop and heals threads already carrying it.
+
+    This is a comparison against one configured string, not a judgement about
+    language - the wording comes from the guardrails stack precisely so there
+    is only one copy of it.
+
     Those messages stay in the checkpoint and in the audit record. They are
     simply not shown back to the model as its own prior output.
     """
-    return [m for m in messages
-            if not getattr(m, "additional_kwargs", {}).get("system_authored")]
+    blocked = _norm_text(settings().guardrail_blocked_message)
+    out = []
+    for m in messages:
+        if getattr(m, "additional_kwargs", {}).get("system_authored"):
+            continue
+        if blocked and getattr(m, "type", "") == "ai" and \
+                _norm_text(_text_of(m)) == blocked:
+            continue
+        out.append(m)
+    return out
+
+
+def _norm_text(s: str) -> str:
+    """Compare on words. YAML folding and the odd trailing space are not a
+    difference worth failing to recognise the sentence over."""
+    return " ".join((s or "").split()).strip().lower()
 
 
 def _last_human_text(state: BotState) -> str | None:
