@@ -160,12 +160,23 @@ def test_an_image_is_not_treated_as_text(webhook):
 
 
 # --- the formatter may not invent ------------------------------------------
-def test_figures_are_extracted_from_money_percentages_and_references(formatter):
+def test_every_number_is_compared_not_only_the_ones_that_look_important(formatter):
+    """Digit runs, not "figures that carry meaning".
+
+    The pattern this replaced tried to describe which numbers mattered -
+    money, percentages, reference numbers - and describing that is a
+    judgement about language, which is what this check must not rest on. A
+    number the description failed to cover went out unchecked.
+    """
     figs = formatter._figures(
         "Premium is 12,499 including 18% GST on policy PHS-4471902.")
-    assert "12499" in figs
-    assert "18%" in figs
-    assert "PHS-4471902" in figs
+    assert figs == {"12499", "18", "4471902"}
+
+
+def test_a_number_written_two_ways_is_one_figure(formatter):
+    """The formatter may change how a number is written - grouping, decimal
+    marks - and may not change which number it is."""
+    assert formatter._figures("Rs 24,780.50") == formatter._figures("24780.50")
 
 
 def test_a_reformat_that_keeps_every_figure_is_accepted(formatter, monkeypatch):
@@ -179,7 +190,7 @@ def test_a_reformat_that_invents_a_figure_is_caught(formatter):
     """The check that makes a presentation model safe to run last."""
     original = "Your premium is 12,499."
     invented = "Your premium is 12,499, with 25% no-claim bonus."
-    assert formatter._figures(invented) - formatter._figures(original) == {"25%"}
+    assert formatter._figures(invented) - formatter._figures(original) == {"25"}
 
 
 def test_a_reformat_that_changes_a_figure_is_caught(formatter):

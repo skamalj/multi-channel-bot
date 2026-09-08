@@ -5,11 +5,24 @@ is vendor-specific: the agent loop runs on Kimi K2.5, Nova, Claude or
 anything else Bedrock exposes with `toolConfig`, and the model id is
 configuration.
 
-Two small-model helpers live here as well. Both are deliberately off the
-answer path: an intent classification that only runs when the deterministic
-signals produced nothing, and a reranker that is the drop-in for a real
-cross-encoder. Both fail CLOSED - a classifier that errors returns "no
-opinion", which routes to asking the customer, and never to a guess.
+The small judgements live here too, and they are here rather than scattered
+because each one replaced a pattern that got language wrong:
+
+* `classify_lob` routes a turn to health or motor. It used to be a keyword
+  list at 0.95 confidence with the model kept as a last resort.
+* `read_confirmation` decides whether a customer consented. It used to be two
+  regexes anchored on the first word, and "ok but not the payment" was read
+  as consent to take the payment.
+* `asked_for_a_person` decides whether somebody asked for a human. It used to
+  be a word list that did not match "can I speak with somebody".
+* `score_relevance` is the drop-in for a real cross-encoder.
+
+They do not fail the same way, and the difference is deliberate.
+`read_confirmation` fails to "unclear", because a transaction must not
+execute because an endpoint was slow. `classify_lob` fails to "no opinion",
+which routes to a question rather than a guess. `asked_for_a_person` fails to
+YES, because making somebody argue their way out of a bot is the wrong place
+to be strict.
 
 `MOCK_LLM=1` swaps in a scripted stub so the whole pipeline - resolver,
 binding, tools, gates, citations - runs with no credentials at all.
@@ -18,7 +31,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 from app.config import settings
@@ -89,11 +101,11 @@ class StubLLM:
                 return call("quote_create_motor",
                             {"product_id": "PMS", "idv": 480000, "ncb_pct": 35,
                              "vehicle_age_years": 4, "addons": []})
-        m = re.search(r"\b([A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{4})\b", text)
-        if m and "vehicle_lookup" in n:
-            return call("vehicle_lookup", {"registration": m.group(1)})
+        reg = _registration_like(text)
+        if reg and "vehicle_lookup" in n:
+            return call("vehicle_lookup", {"registration": reg})
         if "waiting period" in low and "member_waiting_periods" in n \
-                and re.search(r"\bmy\b", low):
+                and " my " in f" {low} ":
             return call("member_waiting_periods", {"policy_id": "PHS-4471902"})
         for kb in ("kb_search_health", "kb_search_motor"):
             if kb in n:
@@ -101,8 +113,15 @@ class StubLLM:
         return None
 
     def _compose(self, messages) -> str:
-        """Answer from the tool result, citing chunk ids - which is exactly
-        what the citation guardrail then checks."""
+        """Answer from the tool result, citing the passage NUMBER - which is
+        what the retrieval tool asks the real model for, and what the citation
+        guardrail then checks.
+
+        This cited the chunk id until the regexes came out of citations.py,
+        and passed only because the old pattern happened to find a digit
+        inside `PHS-POLICY_WORDING-V2#1`. A stub that exercises a path no real
+        model takes is worse than no stub.
+        """
         payload: Any = None
         for m in reversed(messages):
             if getattr(m, "type", "") == "tool":
@@ -118,7 +137,7 @@ class StubLLM:
                         "that. I would rather hand you to a colleague than "
                         "guess.")
             top = chunks[0]
-            return (f"{top['text']} [{top['chunk_id']}] "
+            return (f"{top['text']} [{top.get('ref', 1)}] "
                     f"(Source: {top['source']}, {top['section']}, "
                     f"page {top['page']}.)")
         if isinstance(payload, dict) and payload.get("error"):
@@ -179,16 +198,61 @@ def get_llm(small: bool = False, guardrail: bool = True):
 
 
 def _json_from(text: str) -> dict:
-    """Models wrap JSON in prose and fences. Take the first object, or fail."""
+    """Models wrap JSON in prose and fences. Take the first object, or fail.
+
+    Brace-to-brace rather than a pattern: finding the outermost object is
+    counting characters, not recognising a shape.
+    """
     if not text:
         return {}
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
         return {}
     try:
-        return json.loads(m.group(0))
+        return json.loads(text[start:end + 1])
     except Exception:                                        # noqa: BLE001
         return {}
+
+
+_PERSON_PROMPT = """Did this customer ask to be put through to a person?
+
+Answer YES only if they asked for a human being - an agent, an adviser, someone to call them, a complaint to a person. Asking a hard question, or being frustrated, is not asking for a person.
+
+Reply with one word: YES or NO."""
+
+
+def asked_for_a_person(text: str) -> bool:
+    """Did the customer ask for a human, in whatever words they chose?
+
+    This replaced a word list - human|real person|speak to someone|... - which
+    is the same mechanism that once refused the bot's own question because it
+    contained the word "cover". "Can I speak WITH SOMEBODY" does not contain
+    "speak to someone", and a customer asking for a person in slightly the
+    wrong words was told to wait while the bot searched.
+
+    Fails OPEN. Making somebody argue their way out of a bot is the wrong
+    place to be strict, so a model that is unavailable means yes.
+    """
+    cfg = settings()
+    if not (text or "").strip():
+        return False
+    if cfg.mock_llm or cfg.no_aws:
+        return False
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        resp = get_llm(small=True, guardrail=False).invoke([
+            SystemMessage(content=_PERSON_PROMPT),
+            HumanMessage(content=text[:1000])])
+        content = resp.content
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content
+                               if isinstance(b, dict))
+        return "yes" in str(content).strip().lower()[:6]
+    except Exception as exc:                                 # noqa: BLE001
+        log.warning("could not tell if a person was asked for, allowing "
+                    "the handoff: %s", type(exc).__name__)
+        return True
 
 
 _INTENT_PROMPT = """You classify one message from an insurance customer or \
@@ -215,8 +279,8 @@ def classify_lob(text: str, options: list[str]) -> tuple[str | None, float, str]
     cfg = settings()
     if not cfg.intent_model_enabled or not (text or "").strip():
         return None, 0.0, ""
-    if cfg.mock_llm:
-        return None, 0.0, "intent model disabled under MOCK_LLM"
+    if cfg.mock_llm or cfg.no_aws:
+        return _stub_lob(text, options)
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -264,3 +328,130 @@ def score_relevance(query: str, passages: list[dict]) -> dict[str, float]:
     scores = _json_from(str(content)).get("scores", {})
     return {k: float(v) for k, v in scores.items()
             if isinstance(v, (int, float))}
+
+
+_CONFIRM_PROMPT = """A customer was asked to confirm an action - issuing a \
+policy, taking a payment, registering a claim. Decide what their reply means.
+
+YES only if they agreed to that action, as it was put to them, with no \
+condition, no change and no question attached.
+NO if they declined, or asked to stop or wait.
+UNCLEAR for anything else: a question, a hedge, a request to change something \
+first, agreement to only part of it, or two minds in one sentence.
+
+"ok but not the payment" is UNCLEAR - they agreed to some of it.
+"yes, but change the sum insured first" is UNCLEAR - they want something else.
+"ok what does it cost?" is UNCLEAR - that is a question, not consent.
+
+Customers here write in English, Hindi, or Hindi in Latin letters, and often mix them in one sentence. "haan bhai kar do" and "theek hai karo" are plain agreement - YES. Judge what they meant, not which language they used.
+
+Reply with one word: YES, NO or UNCLEAR."""
+
+
+def read_confirmation(text: str | None) -> str:
+    """Did the customer consent to the action we described? AG-6.
+
+    This replaced two regexes, and they were the most dangerous patterns in
+    the system - they decided consent for policy_issue, payment_collect and
+    claim_register by matching the FIRST word of the reply:
+
+        "ok but not the payment"                  -> yes, took the payment
+        "yes, but change the sum insured first"   -> yes, at the old figure
+        "sure, wait - actually no"                -> yes
+        "ok what does it cost?"                   -> yes, instead of answering
+        "confirm the ages first please"           -> yes (matched "confirm")
+
+    Fails CLOSED, unlike every other model call here. An unavailable model
+    returns "unclear", which asks the customer again. Failing open would
+    mean a transaction executing because an endpoint was slow.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "unclear"
+
+    cfg = settings()
+    if cfg.mock_llm or cfg.no_aws:
+        return _stub_confirmation(t)
+
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        # The main model, not the small one. This decides whether money
+        # moves; it is not the place to save a fraction of a cent.
+        resp = get_llm(guardrail=False).invoke([
+            SystemMessage(content=_CONFIRM_PROMPT),
+            HumanMessage(content=t[:1000])])
+        content = resp.content
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content
+                               if isinstance(b, dict))
+        word = str(content).strip().lower()
+        if word.startswith("yes"):
+            return "yes"
+        if word.startswith("no"):
+            return "no"
+        return "unclear"
+    except Exception as exc:                                 # noqa: BLE001
+        log.warning("could not read the confirmation, asking again: %s",
+                    type(exc).__name__)
+        return "unclear"
+
+
+def _stub_confirmation(text: str) -> str:
+    """Offline stand-in for the model, and a stub is all it is.
+
+    It runs only under MOCK_LLM/NO_AWS, where there is no model to ask. It is
+    deliberately literal - whole reply, nothing else - so that it cannot be
+    mistaken for the production rule and quietly become one again.
+    """
+    t = " ".join(text.lower().replace(",", " ").replace(".", " ").split())
+    if t in {"y", "yes", "yes please", "ok", "okay", "go ahead", "confirm",
+             "proceed", "do it", "haan", "haan ji"}:
+        return "yes"
+    if t in {"n", "no", "no thanks", "nope", "cancel", "stop", "not now",
+             "nahi", "never mind"}:
+        return "no"
+    return "unclear"
+
+
+def _registration_like(text: str) -> str | None:
+    """A vehicle registration in the stub's input, found by counting.
+
+    Stub logic: it only has to recognise the seeded registrations so the
+    offline pipeline reaches vehicle_lookup. It validates nothing, and
+    nothing deployed calls it.
+    """
+    for token in (text or "").replace("-", " ").split():
+        core = token.strip(".,;:!?()")
+        if not core.isalnum() or not core[:1].isalpha():
+            continue
+        letters = sum(c.isalpha() for c in core)
+        digits = sum(c.isdigit() for c in core)
+        if letters >= 2 and digits >= 4:
+            return core
+    return None
+
+
+# The offline stand-in for classify_lob. Keyword membership, and it is a STUB -
+# it exists so the pipeline runs with no credentials, in the same way StubLLM
+# stands in for the model itself. The deployed path never reaches it. The
+# routing rule it replaced was keyword matching in the resolver, on the live
+# path, at 0.95 confidence.
+_STUB_LOB_WORDS = {
+    "motor": ("car", "bike", "scooter", "vehicle", "motor", "idv", "ncb",
+              "garage", "windscreen", "bumper"),
+    "health": ("health", "medical", "hospital", "mediclaim", "cashless",
+               "maternity", "opd", "waiting period", "sum insured",
+               "pre-existing", "room rent"),
+}
+
+
+def _stub_lob(text: str, options: list[str]) -> tuple[str | None, float, str]:
+    low = (text or "").lower()
+    hit = {lob: [w for w in words if w in low]
+           for lob, words in _STUB_LOB_WORDS.items() if lob in options}
+    named = {lob: words for lob, words in hit.items() if words}
+    if len(named) != 1:
+        return None, 0.0, "stub: nothing decisive"
+    lob, words = next(iter(named.items()))
+    return lob, 0.95, words[0]

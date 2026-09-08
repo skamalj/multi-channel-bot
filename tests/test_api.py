@@ -139,7 +139,14 @@ def test_an_answer_carries_a_citation_and_the_trace_carries_the_rejects(client):
 
     guard = _events(data, "guardrail", "citations")[0]["detail"]
     assert guard["cited"] and guard["refused"] is False
-    assert any(f"[{c}]" in _reply(data) for c in guard["cited"])
+
+    # The reply cites NUMBERS and the trace names the documents behind them.
+    # This used to assert the chunk id appeared in the reply, and passed only
+    # because a regex found a stray digit inside `PHS-POLICY_WORDING-V2#1`.
+    from app.agents.citations import refs_in
+
+    assert refs_in(_reply(data)), "no numbered citation in the reply"
+    assert guard["invented_refs"] == []
 
 
 def test_a_question_with_no_approved_source_refuses_and_offers_a_human(client):

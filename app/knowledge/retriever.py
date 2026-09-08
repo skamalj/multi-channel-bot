@@ -25,7 +25,6 @@ retrieval you cannot see the misses of is a retrieval you cannot tune.
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date
@@ -34,7 +33,6 @@ from functools import lru_cache
 from app.config import settings
 from app.knowledge.corpus import corpus
 
-_WORD = re.compile(r"[a-z0-9]+")
 _STOP = {
     "the", "and", "for", "are", "was", "with", "that", "this", "from", "have",
     "has", "not", "but", "you", "your", "our", "can", "will", "what", "when",
@@ -45,8 +43,9 @@ _STOP = {
 
 
 def _tokens(text: str) -> list[str]:
-    return [w for w in _WORD.findall((text or "").lower())
-            if len(w) > 2 and w not in _STOP]
+    cleaned = "".join(
+        c if c.isalnum() else " " for c in (text or "").lower())
+    return [w for w in cleaned.split() if len(w) > 2 and w not in _STOP]
 
 
 @dataclass

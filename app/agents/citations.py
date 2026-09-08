@@ -7,22 +7,20 @@ one of those passages.
 **Two jobs, two mechanisms, and the split is the whole design.**
 
 *Is this sentence a claim, and do the passages support it?* is a language
-question, and it lives in `app/agents/verify.py` on a small model. The
-previous version of this file tried to answer it with word lists, and failed
-in both directions in a single turn: it refused the bot's own question -
-"Ages of family members you want to **cover**" - because the word "cover"
-appeared in it, while letting "The premium is 12,499" through completely
-unchecked, because a comma defeated the number regex. Wrong about a question,
-silent about a price. A regex cannot tell an assertion from a question, and
-no amount of patching will teach it to.
+question, and it lives in `app/agents/verify.py` on a model. The version of
+this file before that failed in both directions in a single turn: it refused
+the bot's own question - "Ages of family members you want to **cover**" -
+because the word "cover" appeared in it, while letting "The premium is
+12,499" through completely unchecked, because a comma defeated the number
+regex. Wrong about a question, silent about a price.
 
 *Does `[2]` name a passage we actually sent?* is not a language question at
 all. It is array membership, and it stays here in code. Asking a model that
 would invite it to hallucinate the one fact that has to be certain.
 
-**Citations are NUMBERS now.** The retrieval tool hands the model passages
-labelled `[1]`..`[k]`, not `PHS-POLICY_WORDING-V2#1`. That change removed a
-whole class of failure: the model used to paraphrase the structured id -
+**Citations are NUMBERS.** The retrieval tool hands the model passages
+labelled `[1]`..`[k]`, not `PHS-POLICY_WORDING-V2#1`. That removed a whole
+class of failure: the model used to paraphrase the structured id -
 `PHS-POLICYWORDING-V21`, underscore and hash gone - and a correct, properly
 sourced answer was refused because a string comparison failed. There is no
 fuzzy way to write `[2]`.
@@ -31,19 +29,24 @@ What remains here:
 
 1. A citation naming a passage that was never sent is stripped. A fake
    citation is worse than none, because it looks like provenance.
-2. Sentences the verifier reports as unsupported are dropped.
+2. Units the verifier reports as unsupported are dropped.
 3. If everything material was dropped, or retrieval ran and returned nothing,
    the turn refuses and offers a colleague. An empty answer is a correct
    answer.
+
+**No regular expressions.** Not a style preference. Every pattern that has
+ever lived in this file ended up deciding something about language and
+getting it wrong, and each time a customer's answer was worse for it. What is
+left is scanning a bracket format we chose ourselves, and splitting on line
+breaks. Both are counting characters. Everything that needs a sentence to be
+read is in `verify.py`, on a model.
 """
 from __future__ import annotations
 
-import re
-
 # A bracket may hold more than one reference - "[1, 3]" is how a model
-# naturally cites two passages for one sentence.
-BRACKET = re.compile(r"\[([^\[\]]{1,40})\]")
-REF = re.compile(r"\b(\d{1,2})\b")
+# naturally cites two passages for one sentence. Anything longer than this is
+# prose in brackets, not a citation.
+MAX_BRACKET = 40
 
 REFUSAL = (
     "I could not find anything in our documented sources that answers that, "
@@ -58,21 +61,44 @@ REFUSAL_ACTION = (
     "and I would rather tell you than let you think it went through. Shall I "
     "put you through to a colleague who can finish it?")
 
-_SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[*#\-])")
-
 
 # ---------------------------------------------------------------------------
 # citation references
 # ---------------------------------------------------------------------------
 def refs_in(text: str) -> list[tuple[str, list[int]]]:
-    """Every bracket in `text`, with the passage numbers inside it."""
+    """Every bracket in `text`, with the passage numbers inside it.
+
+    Scanned, not matched. This is reading back a format we chose and told the
+    model to use - find a bracket, read the numbers in it - and decides
+    nothing about what the sentence means.
+    """
     out: list[tuple[str, list[int]]] = []
-    for m in BRACKET.finditer(text or ""):
-        inner = m.group(1)
-        nums = [int(n) for n in REF.findall(inner)]
+    t = text or ""
+    i = 0
+    while True:
+        open_at = t.find("[", i)
+        if open_at < 0:
+            break
+        close_at = t.find("]", open_at + 1)
+        if close_at < 0:
+            break
+        inner = t[open_at + 1:close_at]
+        i = close_at + 1
+        if len(inner) > MAX_BRACKET:
+            continue
+        nums = _numbers_in(inner)
         if nums:
-            out.append((m.group(0), nums))
+            out.append((t[open_at:close_at + 1], nums))
     return out
+
+
+def _numbers_in(inner: str) -> list[int]:
+    """The passage numbers inside one bracket. `[1, 3]` is two of them."""
+    nums: list[int] = []
+    for token in inner.replace(",", " ").replace(";", " ").split():
+        if token.isdigit() and len(token) <= 2:
+            nums.append(int(token))
+    return nums
 
 
 def strip_unknown_refs(text: str, valid: set[int]) -> tuple[str, list[int]]:
@@ -93,7 +119,16 @@ def strip_unknown_refs(text: str, valid: set[int]) -> tuple[str, list[int]]:
         keep = [n for n in nums if n in valid]
         replacement = ("[" + ", ".join(str(n) for n in keep) + "]") if keep else ""
         cleaned = cleaned.replace(bracket, replacement)
-    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), sorted(set(invented))
+    return _tidy(cleaned), sorted(set(invented))
+
+
+def _tidy(text: str) -> str:
+    """Close the gap a removed bracket leaves, keeping any indentation."""
+    out = []
+    for line in (text or "").splitlines():
+        lead = line[:len(line) - len(line.lstrip())]
+        out.append((lead + " ".join(line.split())).rstrip())
+    return "\n".join(out).strip()
 
 
 def cited_chunk_ids(text: str, chunks: list[dict]) -> list[str]:
@@ -114,22 +149,33 @@ def cited_chunk_ids(text: str, chunks: list[dict]) -> list[str]:
 
 
 def split(answer: str) -> list[str]:
-    """Sentence split that leaves list items and headings alone."""
-    out: list[str] = []
-    for line in (answer or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if re.match(r"^([-*•]|\d+[.)]|#)\s*", stripped):
-            out.append(line)
-        else:
-            out.extend(_SENTENCE.split(line))
-    return [o for o in out if o.strip()]
+    """The units the verifier is shown, and the units that can be dropped.
+
+    Lines, not sentences. Where a sentence ends is a language question, and
+    the pattern that used to answer it here - break after . ! or ? when a
+    capital follows - splits "Rs 24,780. Dr. Rao confirmed" in the wrong
+    place. That mattered more than it looks: the verifier replies with the
+    NUMBER of a unit, so a unit split in the wrong place deletes the wrong
+    text from a customer's answer.
+
+    A line is coarser, and coarse in the safe direction - a dense paragraph
+    is kept or dropped whole, and half a sentence can never be removed with
+    the other half left standing. These answers are written as headings and
+    bullets anyway, so in practice a line is already close to one claim.
+    """
+    return [line for line in (answer or "").splitlines() if line.strip()]
 
 
 def _looks_structured(lines: list[str]) -> bool:
-    return any(l.strip().startswith(("#", "**", "-", "*", "•")) or
-               re.match(r"^\s*\d+[.)]\s", l) for l in lines)
+    """Did the model write a list, or a paragraph? Layout only."""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("#", "**", "-", "*", "•")):
+            return True
+        head = stripped.split(".", 1)[0].split(")", 1)[0]
+        if head.isdigit() and len(head) <= 2 and len(stripped) > len(head):
+            return True
+    return False
 
 
 def _join(kept: list[str]) -> str:
@@ -140,7 +186,11 @@ def _join(kept: list[str]) -> str:
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[*_`#>]+", "", s or "")).strip().lower()
+    """Compare on words, ignoring markdown emphasis and spacing."""
+    text = s or ""
+    for ch in "*_`#>":
+        text = text.replace(ch, "")
+    return " ".join(text.split()).strip().lower()
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +249,15 @@ def enforce(answer: str, chunks: list[dict],
 
     kept: list[str] = []
     dropped: list[str] = []
-    for sentence in split(answer):
-        if _norm(sentence) in unsupported:
-            dropped.append(sentence.strip()[:160])
+    for unit in split(answer):
+        if _norm(unit) in unsupported:
+            dropped.append(unit.strip()[:160])
         else:
-            kept.append(sentence)
+            kept.append(unit)
 
-    # The verifier quotes sentences; if none matched, its quoting was loose
-    # rather than the answer being clean, so treat the whole answer as
-    # unsupported rather than silently passing it.
+    # The verifier names units from this same split, so a verdict that
+    # matches nothing means the check did not do its job. Treat the whole
+    # answer as unsupported rather than silently passing it.
     if not dropped:
         dropped = [u[:160] for u in verdict.unsupported]
         kept = []

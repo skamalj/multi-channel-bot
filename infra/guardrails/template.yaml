@@ -206,16 +206,20 @@ Resources:
             Action: ANONYMIZE
           - Type: INTERNATIONAL_BANK_ACCOUNT_NUMBER
             Action: ANONYMIZE
-        RegexesConfig:
-          # India-specific identifiers the standard entity list does not cover.
-          - Name: PAN
-            Description: Indian Permanent Account Number
-            Pattern: '[A-Z]{5}[0-9]{4}[A-Z]'
-            Action: ANONYMIZE
-          - Name: Aadhaar
-            Description: Indian national identity number
-            Pattern: '\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b'
-            Action: BLOCK
+        # There are no custom regexes here, deliberately.
+        #
+        # There were two - PAN and Aadhaar - and the Aadhaar one was set to
+        # BLOCK on twelve digits beginning 2-9. That is also the shape of an
+        # Indian mobile number written with its country code: the pattern
+        # matched 919820000009, a seeded customer's own number and their
+        # thread id. One echo of a customer's phone number would have
+        # destroyed the whole answer and shown them the block message.
+        #
+        # No pattern can separate those two, because they are the same twelve
+        # digits. The entity types above are ML classifiers rather than
+        # shapes, which is why they stay. The cost of this is stated plainly:
+        # Aadhaar and PAN are no longer specifically detected. Card numbers,
+        # CVV, PIN, passwords, AWS keys, email and IBAN still are.
 
       WordPolicyConfig:
         ManagedWordListsConfig:

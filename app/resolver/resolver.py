@@ -18,7 +18,6 @@ only thing an entry link can do is ask for less than the directory allows.
 """
 from __future__ import annotations
 
-import re
 import time
 
 from app.agents.registry import REGISTRY, spec_for
@@ -28,18 +27,6 @@ from app.obs.trace import Trace
 from app.resolver.ledger import RouteEvent
 from app.resolver.spec import AgentSpec
 from app.resolver.store import ResolverSession
-
-# Deterministic LOB evidence. Explicit statements always outrank the prior.
-LOB_PATTERNS: dict[str, re.Pattern] = {
-    "motor": re.compile(
-        r"\b(car|bike|scooter|vehicle|motor|two[- ]?wheeler|idv|ncb|rto|"
-        r"garage|windscreen|bumper|zero[- ]?dep|"
-        r"[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{4})\b", re.I),
-    "health": re.compile(
-        r"\b(health|medical|hospital|mediclaim|cashless|pre[- ]?auth|"
-        r"floater|top[- ]?up|ped|pre[- ]?existing|maternity|opd|"
-        r"waiting period|sum insured|room rent|co[- ]?pay)\b", re.I),
-}
 
 # Stand-in for producer management. Real implementation: a directory lookup
 # on the identity, never a model call.
@@ -107,19 +94,24 @@ def resolve_persona(user_id: str, session: ResolverSession,
     return persona, "entry" if requested else "producer_lookup", None
 
 
-def _lob_evidence(text: str | None) -> tuple[str | None, float, str]:
+def _lob_evidence(text: str | None,
+                  options: list[str]) -> tuple[str | None, float, str]:
+    """What line of business did the customer name? Decided by a model.
+
+    This was two keyword patterns at 0.95 confidence, with the model kept as
+    a last resort - so the confident, live routing decision was made by a word
+    list and the model only saw what the word list could not read. A customer
+    whose sentence used none of those words was routed on their history; one
+    who mentioned a hospital car park matched both and was asked a needless
+    question.
+
+    The model already had to exist for the cases the words missed. It decides
+    now, and it still fails closed: no opinion routes to a question, never to
+    a guess.
+    """
     if not text:
         return None, 0.0, ""
-    hits = {lob: p.search(text) for lob, p in LOB_PATTERNS.items()}
-    matched = {lob: m for lob, m in hits.items() if m}
-    if len(matched) == 1:
-        lob, m = next(iter(matched.items()))
-        return lob, 0.95, m.group(0)
-    if len(matched) > 1:
-        # Both lines named in one sentence is not weak evidence for one of
-        # them, it is evidence that a question is needed.
-        return None, 0.4, ",".join(sorted(matched))
-    return None, 0.0, ""
+    return classify_lob(text, options)
 
 
 def refresh_holdings(user_id: str, session: ResolverSession,
@@ -155,7 +147,9 @@ def resolve(event_text: str | None, entry_lob: str | None,
                            "entry link", prior, event_text, trace), None
 
     # 2. Explicit statement or hard entity. The user outranks the prior.
-    lob, conf, evidence = _lob_evidence(event_text)
+    lob, conf, evidence = _lob_evidence(event_text, options)
+    trace.add("resolve", "intent_model", value=lob, confidence=conf,
+              evidence=evidence, threshold=threshold)
     if lob and conf >= 0.9 and lob in options:
         return _commit(session, persona, lob, "explicit", conf, evidence,
                        prior, event_text, trace), None
@@ -181,18 +175,13 @@ def resolve(event_text: str | None, entry_lob: str | None,
                        text=(event_text or "")[:300]))
         return spec_for(persona, prior), None
 
-    # 5. The intent model - the LAST resort before asking, and it fails
-    #    closed. Everything above this line is deterministic and auditable;
-    #    this is the only step where a model has an opinion about routing,
-    #    and its opinion still has to clear the threshold.
-    if lob is None:
-        mlob, mconf, mevidence = classify_lob(event_text or "", options)
-        trace.add("resolve", "intent_model", value=mlob, confidence=mconf,
-                  evidence=mevidence, threshold=threshold)
-        if mlob and mconf >= threshold:
-            return _commit(session, persona, mlob, "intent_model", mconf,
-                           mevidence or "intent model", prior, event_text,
-                           trace), None
+    # 5. The model had an opinion, but not a confident one. It still has to
+    #    clear the threshold, which rises while work is in flight - moving
+    #    somebody mid-application costs more than asking them.
+    if lob and conf >= threshold and lob in options:
+        return _commit(session, persona, lob, "intent_model", conf,
+                       evidence or "intent model", prior, event_text,
+                       trace), None
 
     # 6. Nothing decided. One question beats a wrong route - and the answer is
     #    the highest-quality label there is.

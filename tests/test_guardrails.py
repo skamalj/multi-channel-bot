@@ -374,3 +374,54 @@ def test_the_internal_checks_do_not_carry_the_customer_guardrail(monkeypatch):
     bedrock.get_llm()                       # the customer-facing call
     bedrock.get_llm(guardrail=False)        # an internal check
     assert seen == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# consent - the highest-stakes decision in the system
+# ---------------------------------------------------------------------------
+def test_a_qualified_yes_is_not_consent(monkeypatch):
+    """These all read as YES when two regexes decided consent, anchored on the
+    first word of the reply. The actions behind that gate are policy_issue,
+    payment_collect and claim_register - so "ok but not the payment" took the
+    payment, and "yes, but change the sum insured first" issued at the old
+    figure. Nothing that carries a condition, a change or a question is
+    consent to what was actually proposed."""
+    from app.llm import bedrock
+
+    class _Msg:
+        def __init__(self, t): self.content = t
+
+    class _LLM:
+        def __init__(self, verdict): self.verdict = verdict
+        def invoke(self, _m): return _Msg(self.verdict)
+
+    for reply, verdict in [
+        ("ok but not the payment", "UNCLEAR"),
+        ("yes, but change the sum insured to 5 lakh first", "UNCLEAR"),
+        ("sure, wait - actually no", "UNCLEAR"),
+        ("ok what does it cost?", "UNCLEAR"),
+        ("confirm the ages first please", "UNCLEAR"),
+        ("go on then", "YES"),
+        ("that works for me", "YES"),
+    ]:
+        monkeypatch.setattr(bedrock, "settings", lambda: type(
+            "C", (), {"mock_llm": False, "no_aws": False})())
+        monkeypatch.setattr(bedrock, "get_llm",
+                            lambda *a, **k: _LLM(verdict))
+        got = confirm.read_answer(reply)
+        want = verdict.lower()
+        assert got == want, f"{reply!r} read as {got}, expected {want}"
+
+
+def test_an_unreadable_confirmation_asks_again_rather_than_proceeding(monkeypatch):
+    """Fails CLOSED, unlike every other model call in the build. A payment
+    must not go through because an endpoint was slow."""
+    from app.llm import bedrock
+
+    def _boom(*a, **k):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr(bedrock, "settings", lambda: type(
+        "C", (), {"mock_llm": False, "no_aws": False})())
+    monkeypatch.setattr(bedrock, "get_llm", _boom)
+    assert confirm.read_answer("yes go ahead") == "unclear"

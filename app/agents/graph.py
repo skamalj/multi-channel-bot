@@ -26,7 +26,6 @@ conversation.
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
@@ -36,7 +35,7 @@ from app.agents import citations, confirm, guardrail, reduce as reducer
 from app.mcpserver.registry import get_tool as spec_for_tool
 from app.agents.state import BotState
 from app.config import settings
-from app.llm.bedrock import get_llm
+from app.llm.bedrock import asked_for_a_person, get_llm
 from app.mcpserver.registry import authorize, get_tool, json_schema, list_tools
 from app.memory.checkpoint import bot_checkpointer
 from app.obs.trace import Trace
@@ -52,13 +51,11 @@ KNOWN_FACTS_KEPT = 4
 # prompt asks for a lookup first; this enforces it, because a control that
 # depends on a model reading an instruction is not a control.
 #
-# The exception is the customer asking for a person in so many words. Making
-# somebody argue their way out of a bot is the wrong place to be strict.
-WANTS_HUMAN = re.compile(
-    r"\b(human|real person|speak to someone|talk to someone|"
-    r"representative|customer care|call ?back|call me|escalate|complaint)\b",
-    re.I)
-
+# The exception is the customer asking for a person, and whether they asked is
+# decided by a model - see asked_for_a_person in app/llm/bedrock.py. It used to
+# be a word list, which does not match "can I speak WITH SOMEBODY", so that
+# customer was made to wait while the bot searched. Making somebody argue their
+# way out of a bot is the wrong place to be strict.
 HANDOFF = ("I could not complete that in a reasonable number of steps, and I "
            "would rather not keep you guessing. Let me put you through to a "
            "colleague who can pick this up with everything you have told me.")
@@ -259,7 +256,7 @@ class Agent:
             out["tools_called"].append(name)
 
             if name == "human_handoff" and not state.get("looked_up") \
-                    and not WANTS_HUMAN.search(user_text or ""):
+                    and not asked_for_a_person(user_text or ""):
                 trace.add("gate", "handoff_before_lookup",
                           detail="refused: nothing was looked up first")
                 out["messages"].append(ToolMessage(

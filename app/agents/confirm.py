@@ -16,18 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 from typing import Any
-
-AFFIRMATIVE = re.compile(
-    r"^\s*(y|ya|yes|yep|yeah|ok|okay|sure|please do|go ahead|do it|confirm|"
-    r"confirmed|proceed|haan|haan ji|ji|theek hai|thik hai|correct|that's "
-    r"right|thats right)\b", re.I)
-
-NEGATIVE = re.compile(
-    r"^\s*(n|no|nope|not now|don'?t|do not|cancel|stop|wait|hold on|nahi|"
-    r"nahin|later|never mind|nevermind)\b", re.I)
 
 TTL_S = 30 * 60
 
@@ -91,10 +81,13 @@ def clear(state: dict) -> None:
 
 
 def read_answer(text: str | None) -> str:
-    """"yes" / "no" / "unclear" - and unclear means ask again, not proceed."""
-    t = (text or "").strip()
-    if AFFIRMATIVE.match(t):
-        return "yes"
-    if NEGATIVE.match(t):
-        return "no"
-    return "unclear"
+    """"yes" / "no" / "unclear" - and unclear means ask again, not proceed.
+
+    Decided by a model. This was two regexes anchored at the first word, and
+    they were the most dangerous patterns in this codebase: "ok but not the
+    payment" was read as consent to take the payment. See read_confirmation
+    in app/llm/bedrock.py for the rest of what they got wrong.
+    """
+    from app.llm.bedrock import read_confirmation
+
+    return read_confirmation(text)

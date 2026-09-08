@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 
 from app.config import settings
@@ -107,12 +106,17 @@ def _passages(chunks: list[dict]) -> str:
 
 
 def _json_from(text: str) -> dict:
-    """Take the first object. Models wrap JSON in prose and fences."""
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
+    """Take the outermost object. Models wrap JSON in prose and fences.
+
+    Brace to brace rather than a pattern - finding the object is counting
+    characters, not recognising a shape.
+    """
+    t = text or ""
+    start, end = t.find("{"), t.rfind("}")
+    if start < 0 or end <= start:
         return {}
     try:
-        return json.loads(m.group(0))
+        return json.loads(t[start:end + 1])
     except Exception:                                        # noqa: BLE001
         return {}
 

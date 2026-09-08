@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import urllib.error
 import urllib.request
 
@@ -56,9 +55,6 @@ SYSTEM = (
     "Return only the reformatted message."
 )
 
-# A number that carries meaning: money, percentages, policy and claim
-# references. Used to prove the formatter invented nothing.
-_FIGURE = re.compile(r"\d[\d,]*\.?\d*%?|\b[A-Z]{2,5}-\d{4,}\b")
 
 
 def _param(name: str) -> str:
@@ -70,8 +66,32 @@ def _param(name: str) -> str:
 
 
 def _figures(text: str) -> set[str]:
-    return {m.group(0).rstrip(".").replace(",", "")
-            for m in _FIGURE.finditer(text or "")}
+    """Every run of digits in the text, grouping and decimal marks removed.
+
+    Scanned character by character rather than matched. The pattern this
+    replaced tried to describe which numbers "carry meaning" - money,
+    percentages, reference numbers - and a description like that is a
+    judgement about language, which is the one thing this check must not rest
+    on. Every digit run is compared instead: coarser, and coarse in the safe
+    direction, because an extra comparison sends the governed text while a
+    figure the pattern failed to describe would have gone out unchecked.
+
+    "Rs 24,780.50" and "24780.50" are one figure here. The formatter may
+    change how a number is written; it may not change which number it is.
+    """
+    out: set[str] = set()
+    current: list[str] = []
+    for ch in (text or ""):
+        if ch.isdigit():
+            current.append(ch)
+        elif ch in ",." and current:
+            continue                  # grouping and decimal marks join a run
+        elif current:
+            out.add("".join(current))
+            current = []
+    if current:
+        out.add("".join(current))
+    return out
 
 
 def _format(text: str) -> str:
