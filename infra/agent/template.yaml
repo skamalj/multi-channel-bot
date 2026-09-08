@@ -195,8 +195,17 @@ Resources:
       Tags:
         Project: !Ref Prefix
 
-  # A named endpoint so the console has a stable address to invoke, rather
-  # than depending on whatever version was deployed last.
+  # A named endpoint so callers have a stable address to invoke.
+  #
+  # THE TRAP, and it is the same one Bedrock Guardrails has: an endpoint pins
+  # to a runtime VERSION, and updating the runtime does not move it. Without
+  # the explicit AgentRuntimeVersion below, the runtime went to version 4
+  # with a new image while `live` went on serving version 1 - so every deploy
+  # built and pushed an image that nobody was serving, and the stack reported
+  # success each time.
+  #
+  # Binding it to the runtime's current version means a new image is actually
+  # what answers.
   RuntimeEndpoint:
     Type: AWS::BedrockAgentCore::RuntimeEndpoint
     DeletionPolicy: Delete
@@ -204,7 +213,8 @@ Resources:
     Properties:
       Name: live
       AgentRuntimeId: !GetAtt Runtime.AgentRuntimeId
-      Description: The endpoint the console invokes.
+      AgentRuntimeVersion: !GetAtt Runtime.AgentRuntimeVersion
+      Description: The endpoint callers invoke. Follows the runtime version.
 
 Outputs:
   AgentRuntimeArn:

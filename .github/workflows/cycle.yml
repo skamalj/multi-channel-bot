@@ -83,6 +83,15 @@ jobs:
           echo "--- events ---"; cat events.txt
           grep -q 'RUN_STARTED'  events.txt || { echo "no RUN_STARTED";  exit 1; }
           grep -q 'RUN_FINISHED' events.txt || { echo "no RUN_FINISHED"; exit 1; }
+          # The endpoint pins to a runtime VERSION and does not follow an
+          # update on its own. That meant a new image could deploy, report
+          # success, and never answer a single request. Assert that the
+          # version serving traffic is the one just deployed.
+          RID=$(aws cloudformation describe-stacks --stack-name ${PREFIX}-agent --query "Stacks[0].Outputs[?OutputKey=='AgentRuntimeId'].OutputValue" --output text)
+          RV=$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$RID" --query 'agentRuntimeVersion' --output text)
+          EV=$(aws bedrock-agentcore-control get-agent-runtime-endpoint --agent-runtime-id "$RID" --endpoint-name live --query 'liveVersion' --output text)
+          echo "runtime version $RV, live endpoint serving $EV"
+          [ "$RV" = "$EV" ] || { echo "the live endpoint is not serving the deployed version"; exit 1; }
           echo "AG-UI turn completed"
 
       - name: the knowledge base answers a retrieval
