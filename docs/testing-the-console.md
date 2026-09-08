@@ -202,7 +202,7 @@ model; the answer should still refuse for lack of a source.
 **First request after an idle period is slow.** Redshift Serverless pauses
 when unused and the AgentCore session has to start - 20-30 seconds.
 
-## 5. If something looks wrong
+## 6. If something looks wrong
 
 The glass box usually says why. Failing that:
 

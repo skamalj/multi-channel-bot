@@ -253,3 +253,60 @@ def test_a_parked_confirmation_expires():
     state["pending_confirmation"]["ts"] = time.time() - confirm.TTL_S - 1
     assert confirm.pending_of(state) is None
     assert "pending_confirmation" not in state
+
+
+# ---------------------------------------------------------------------------
+# the verifier's own number-to-sentence mapping - code, so tested as code
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def verdict_json(monkeypatch):
+    """Make the verifier run for real against a canned model reply."""
+    from app.llm import bedrock
+
+    def _set(payload: str):
+        class _Msg:
+            content = payload
+
+        class _LLM:
+            def invoke(self, _messages):
+                return _Msg()
+
+        monkeypatch.setattr(bedrock, "get_llm", lambda small=False: _LLM())
+        monkeypatch.setattr(verify, "configured", lambda: True)
+    return _set
+
+
+ANSWER = ("Pre-existing diseases are covered after 36 months [1].\n"
+          "We also give you a free gym membership.")
+
+
+def test_a_number_names_the_sentence_it_points_at(verdict_json):
+    verdict_json('{"unsupported": [2]}')
+    v = verify.check(ANSWER, CHUNKS)
+    assert v.ran and v.unsupported == ["We also give you a free gym membership."]
+
+
+def test_a_number_outside_the_draft_is_not_a_sentence(verdict_json):
+    """A verdict naming sentence 9 of a two-sentence reply located nothing.
+    Treating that as clean would pass the answers it was least sure about."""
+    verdict_json('{"unsupported": [9]}')
+    assert verify.check(ANSWER, CHUNKS).ran is False
+
+
+def test_a_verdict_naming_nothing_is_a_pass(verdict_json):
+    verdict_json('{"unsupported": []}')
+    v = verify.check(ANSWER, CHUNKS)
+    assert v.ran and v.unsupported == []
+
+
+def test_numbers_arriving_as_strings_still_map(verdict_json):
+    """Models write "2." as readily as 2, and that is not a failed check."""
+    verdict_json('{"unsupported": ["2."]}')
+    assert verify.check(ANSWER, CHUNKS).unsupported == \
+        ["We also give you a free gym membership."]
+
+
+def test_a_reply_that_is_not_json_is_a_failed_check_not_a_pass(verdict_json):
+    verdict_json("I could not determine that.")
+    v = verify.check(ANSWER, CHUNKS)
+    assert v.ran is False and v.error == "unparseable_verdict"
