@@ -151,12 +151,41 @@ def test_a_question_refuses_in_question_words_not_action_words(verdict):
 # ---------------------------------------------------------------------------
 # refusal
 # ---------------------------------------------------------------------------
-def test_retrieval_that_found_nothing_refuses(verdict):
-    verdict()
+def test_retrieval_that_found_nothing_refuses_a_claim(verdict):
+    """With nothing retrieved there is nothing to cite, so the verifier flags
+    the claim and the turn refuses."""
+    verdict(unsupported=["Dental implants are covered."])
     out, rep = citations.enforce("Dental implants are covered.", [],
                                  retrieval_ran=True)
     assert out == citations.REFUSAL
     assert rep["refused"] is True
+
+
+def test_retrieval_that_found_nothing_still_lets_the_bot_ask_a_question(verdict):
+    """The failure this was reported as. "What are other benefits of this"
+    scores below the retrieval floor, nothing comes back, and the model
+    writes "which plan did you mean?" - which used to be thrown away and
+    replaced with "I could not find anything in our documented sources".
+    Refusing a question for lacking a citation is the same fault as refusing
+    "ages of family members you want to cover"."""
+    verdict()
+    out, rep = citations.enforce(
+        "Which product are you asking about - Health Secure, Super Top-Up or "
+        "Senior Care?", [], retrieval_ran=True)
+    assert "Which product" in out
+    assert rep["refused"] is False
+
+
+def test_without_a_verifier_an_empty_retrieval_still_refuses(verdict):
+    """Degraded, and deliberately blunt. Nothing left can tell a question
+    from a claim, so an unchecked answer with nothing behind it must not go
+    out just because the model endpoint was slow."""
+    verdict(ran=False, error="ThrottlingException")
+    out, rep = citations.enforce("Dental implants are covered.", [],
+                                 retrieval_ran=True)
+    assert out == citations.REFUSAL
+    assert rep["refused"] is True
+    assert rep["verifier"] == "ThrottlingException"
 
 
 def test_an_answer_whose_every_claim_is_unsupported_refuses(verdict):

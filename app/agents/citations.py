@@ -225,11 +225,22 @@ def enforce(answer: str, chunks: list[dict],
     answer, invented = strip_unknown_refs(answer, valid)
     report["invented_refs"] = invented
 
-    # Nothing retrieved and nothing else to stand on: there is no answer to
-    # give, whatever the model wrote.
-    if retrieval_ran and not chunks and not other_tool_evidence:
-        report["refused"] = True
-        return (REFUSAL_ACTION if action_attempted else REFUSAL), report
+    # Retrieval ran and found nothing, and no tool result stands behind the
+    # turn either. That USED to refuse here, before reading what the model
+    # wrote - and a vague follow-up is exactly when it bites. "What are other
+    # benefits of this" scores below the retrieval floor, nothing comes back,
+    # and the model quite correctly writes "which plan did you mean?" - which
+    # was then thrown away and replaced with "I could not find anything in
+    # our documented sources". A question refused for lacking a citation is
+    # the same fault as refusing "ages of family members you want to cover".
+    #
+    # The verifier decides instead. Measured with NO passages at all, 6 runs
+    # each: a clarifying question and an offer to look something up came back
+    # clean 6/6; an invented benefit, an invented premium, and a question
+    # with a claim attached were all flagged 6/6. Given nothing to cite, it
+    # flags everything that needed citing - which is the whole rule.
+    nothing_to_stand_on = (retrieval_ran and not chunks
+                           and not other_tool_evidence)
 
     # 2. Does the source material support what was written?
     verdict = verify.check(answer, chunks, established=established)
@@ -237,8 +248,15 @@ def enforce(answer: str, chunks: list[dict],
                           else (verdict.error or "not_configured"))
 
     if not verdict.ran:
-        # Degraded, and the trace says so. The reference check above still
-        # applied, so a fabricated citation was still removed.
+        # Degraded, and the trace says so. Without a verifier nothing here
+        # can tell a question from a claim, so the blunt rule comes back:
+        # when there was nothing to stand on, refuse rather than pass an
+        # unchecked answer.
+        if nothing_to_stand_on:
+            report["refused"] = True
+            return (REFUSAL_ACTION if action_attempted else REFUSAL), report
+        # The reference check above still applied, so a fabricated citation
+        # was still removed.
         report["cited"] = cited_chunk_ids(answer, chunks)
         return answer, report
 
