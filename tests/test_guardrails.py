@@ -7,7 +7,7 @@ defeated a number regex. The word lists are gone. Two mechanisms now:
 
 * **code** decides whether `[2]` names a passage that was actually sent -
   array membership, tested here exhaustively because it must never be wrong;
-* **a small model** decides whether a sentence is a supported claim, and is
+* **a model** decides whether a sentence is a supported claim, and is
   stubbed in these tests. Its own behaviour is measured separately, against
   the real model, because a stub only proves the stub works.
 

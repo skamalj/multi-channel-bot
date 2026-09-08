@@ -58,8 +58,9 @@ observed, not what the design intends.
 
 > `what is the maternity waiting period on health secure`
 
-**Expect:** an answer around **36 months**, with a citation in square brackets
-like `[PHS-POLICY_WORDING-V2#1]`.
+**Expect:** an answer around **36 months**, with citations in square brackets
+like `[1]` and `[2]`. The glass box names the real documents behind those
+numbers.
 
 **In the glass box, expect roughly fifteen events, including:**
 
@@ -159,8 +160,8 @@ you found the first one.
 **`help me choose health insurance` now works.** It used to be refused: the
 citation rule matched the word "cover" in the bot's own question - "Ages of
 family members you want to cover" - and threw the turn away. The word lists
-are gone. A small model now decides whether a sentence is a supported claim,
-and code only decides whether `[2]` names a passage that was actually sent.
+are gone. A model now decides whether a sentence is a supported claim, and
+code only decides whether `[2]` names a passage that was actually sent.
 
 **Follow-ups work.** Ask 3.1, then `and how many months was that again?` It
 answers, because facts this conversation already established with a source
@@ -188,8 +189,9 @@ turn still proceeds - it degrades rather than refusing everything - but the
 answer had less scrutiny than it looks. That is worth reporting.
 
 `guardrail/grounding` now says `alarm` and `enforced: false`. A score below
-threshold is recorded, not blocked. On a correct answer it scored 0.3 in
-testing, which is why it does not decide anything.
+threshold is recorded, not blocked. Two correct answers to the same question
+scored 0.3 and 0.72 on consecutive runs, which is exactly why it is not
+allowed to decide anything.
 
 ## 5. Still rough
 
