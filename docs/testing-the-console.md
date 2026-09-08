@@ -151,33 +151,56 @@ after an idle spell can take 20–30 seconds while the model warms up.
 
 ---
 
-## 4. Known rough edges
+## 4. What changed since the first draft of this script
 
-Not bugs you have found — bugs already found, so you can tell them apart from
-new ones.
+The three rough edges listed here before are fixed. Worth re-testing, because
+you found the first one.
 
-**A follow-up that relies on the previous answer gets refused.**
-Ask 3.1, then ask `and how many months was that again?`. The model *does*
-remember — memory is working — but the citation guardrail refuses it, because
-this turn retrieved nothing and so the claim carries no citation that
-resolves. The glass box shows `cited: []`, `refused: true`, and the dropped
-sentence, which is correct. The guardrail is right about its rule and wrong
-about the conversation. Three fixes are on the table; none is applied yet.
+**`help me choose health insurance` now works.** It used to be refused: the
+citation rule matched the word "cover" in the bot's own question - "Ages of
+family members you want to cover" - and threw the turn away. The word lists
+are gone. A small model now decides whether a sentence is a supported claim,
+and code only decides whether `[2]` names a passage that was actually sent.
 
-**The refusal wording is sometimes the wrong one.** You may see *“I have not
-done that…”* — phrased for an action — in reply to a plain question. The
-refusal classifier mis-fires.
+**Follow-ups work.** Ask 3.1, then `and how many months was that again?` It
+answers, because facts this conversation already established with a source
+are passed to the verifier.
 
-**Grounding is recorded, not enforced.** `guardrail/grounding` may say
-`blocked: true` and the answer still appears. That is deliberate: measured on
-real answers the score was 0.56 on one run and 0.14 on the next for the *same
-correct answer*, which does not separate good from fabricated. The citation
-rule decides; the score is watched.
+**Citations are numbers now.** You will see `[1]` and `[2]` in answers rather
+than `[PHS-POLICY_WORDING-V2#1]`. The model used to paraphrase the long id -
+dropping the underscore and the hash - and a correct answer was refused on a
+string comparison. There is no fuzzy way to write `[2]`. The glass box still
+names the real document under `cited`.
+
+### New things worth watching in the glass box
+
+`guardrail/citations` now shows:
+
+```
+verifier   : ran | not_configured | <an exception name>
+cited      : the real chunk ids behind the numbers
+dropped    : sentences the passages did not support
+invented_refs : numbers the model cited that were never sent
+```
+
+**If `verifier` is anything other than `ran`, the check did not happen.** The
+turn still proceeds - it degrades rather than refusing everything - but the
+answer had less scrutiny than it looks. That is worth reporting.
+
+`guardrail/grounding` now says `alarm` and `enforced: false`. A score below
+threshold is recorded, not blocked. On a correct answer it scored 0.3 in
+testing, which is why it does not decide anything.
+
+## 5. Still rough
+
+**Bedrock's topic classifier misses some phrasings** even when given an exact
+matching example. A medical question worded unusually may get through to the
+model; the answer should still refuse for lack of a source.
+
+**WhatsApp is unexercised.** It needs Meta credentials that do not exist yet.
 
 **First request after an idle period is slow.** Redshift Serverless pauses
-when unused, and the AgentCore session has to start.
-
----
+when unused and the AgentCore session has to start - 20-30 seconds.
 
 ## 5. If something looks wrong
 
