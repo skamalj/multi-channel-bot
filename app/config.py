@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     # the answers it produced.
     prompt_version: str = "v0.3"
 
+    # The deployed AgentCore Runtime. When set, the console's /agui endpoint
+    # SIGNS and PROXIES to it; when empty it runs the agent in-process, which
+    # is what local development and the offline tests use.
+    agent_runtime_arn: str = ""
+    agent_qualifier: str = "live"
+
     # Bedrock Guardrails (deployed by infra/guardrails). Empty means no
     # guardrail is attached, which is the offline and test posture - the
     # deploy asserts it is set in a real environment rather than letting a

@@ -2,10 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "mcb",
+      "name": "console",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "console"],
+      "port": 3000
+    },
+    {
+      "name": "backend",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "uvicorn", "app.main:app", "--reload", "--port", "8077"],
-      "port": 8077
+      "runtimeArgs": ["run", "uvicorn", "app.main:app", "--port", "8000", "--reload"],
+      "port": 8000
     }
   ]
 }

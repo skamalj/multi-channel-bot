@@ -9,3 +9,6 @@ dist/
 venv/
 .aws-sam/
 response.json
+console/node_modules/
+console/.next/
+console/next-env.d.ts

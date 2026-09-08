@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import (FileResponse, JSONResponse,
+                               StreamingResponse)
 from pydantic import BaseModel
 
 from app.agents.registry import REGISTRY, capability_matrix
@@ -182,3 +183,124 @@ async def wa_inbound(request: Request):
         handle(ev)
     return {"status": "ok", "parsed": len(events),
             "note": "inbound parsing is live; outbound send is not wired"}
+
+
+# ---------------------------------------------------------------------------
+# AG-UI
+# ---------------------------------------------------------------------------
+# The console is an AG-UI CLIENT and this is what it talks to. AG-UI is a
+# protocol with two sides: the agent EMITS the events and something with a
+# screen CONSUMES them. The emitting half lives in `app/agui.py` and in the
+# Runtime container; this is the seam that lets a browser reach either.
+#
+# Two modes, and the difference is only where the turn runs:
+#
+#   remote - `agent_runtime_arn` is set. The request is signed with SigV4 and
+#            proxied to the deployed AgentCore Runtime, and the response is
+#            streamed through UNCHANGED. This exists because a browser cannot
+#            hold AWS credentials, so something has to sign, and that is the
+#            whole reason "FastAPI for both" was the design.
+#
+#   local  - no ARN. The agent runs in this process. Same events, no AWS.
+#
+# The console cannot tell which it is talking to, which is the point: what it
+# renders against a laptop is what it renders against the deployment.
+@app.post("/agui")
+async def agui(request: Request) -> StreamingResponse:
+    from app.agui import stream
+
+    payload = await request.json()
+    cfg = settings()
+
+    if not cfg.agent_runtime_arn:
+        return StreamingResponse(
+            stream(payload), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    return StreamingResponse(
+        _proxy_to_runtime(payload, cfg), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _proxy_to_runtime(payload: dict, cfg):
+    """Sign, invoke, and pass the event stream straight through.
+
+    Nothing is parsed or re-emitted here. A proxy that rebuilt the events
+    would be a second implementation of the protocol, and the console would
+    be testing the proxy rather than the agent.
+    """
+    import hashlib
+    import json as _json
+
+    import boto3
+
+    thread = payload.get("threadId") or "anonymous"
+    # runtimeSessionId has a 33-character minimum and our user ids are phone
+    # numbers, so it is derived rather than padded - and derived from the
+    # thread, so the same person keeps the same runtime session.
+    session = hashlib.sha256(f"console:{thread}".encode()).hexdigest()
+
+    try:
+        resp = boto3.client("bedrock-agentcore",
+                            region_name=cfg.aws_region).invoke_agent_runtime(
+            agentRuntimeArn=cfg.agent_runtime_arn,
+            runtimeSessionId=session,
+            qualifier=cfg.agent_qualifier,
+            payload=_json.dumps(payload).encode())
+    except Exception as exc:                                 # noqa: BLE001
+        log.exception("runtime invocation failed")
+        yield ("data: " + _json.dumps({
+            "type": "RUN_ERROR", "code": "AGENT_ERROR",
+            "message": f"{type(exc).__name__}: {exc}"}) + "\n\n")
+        return
+
+    body = resp.get("response")
+    for chunk in body:
+        if not chunk:
+            continue
+        yield chunk.decode() if isinstance(chunk, (bytes, bytearray)) else chunk
+
+
+# The last turn's trace, per thread.
+#
+# The glass box needs these and CopilotKit's client does not forward AG-UI
+# CUSTOM events to a subscriber - the chat renders, the trace never arrives.
+# Rather than keep guessing at another library's internals, the bridge keeps
+# what it already produced and the console asks for it.
+#
+# Honest about what this is: the trace is FETCHED after the turn rather than
+# streamed during it. The events and their order are the real ones; the
+# liveness is not. Bounded per thread so a long conversation cannot grow it
+# without limit.
+_LAST_TRACE: dict[str, list] = {}
+_TRACE_THREADS = 32
+
+
+def _remember_trace(thread: str, events: list) -> None:
+    if len(_LAST_TRACE) >= _TRACE_THREADS and thread not in _LAST_TRACE:
+        _LAST_TRACE.pop(next(iter(_LAST_TRACE)), None)
+    _LAST_TRACE[thread] = events
+    # Also under a fixed key. CopilotKit mints a NEW threadId per run, so the
+    # console cannot ask for "the trace for my thread" - it does not have a
+    # stable one. This is a single-operator development console, so "the last
+    # turn" is the right question for it to ask, and saying so is better than
+    # pretending the key means something it does not.
+    _LAST_TRACE["__last"] = events
+
+
+@app.get("/api/agui/trace/{thread}")
+def agui_trace(thread: str) -> dict:
+    return {"thread": thread, "events": _LAST_TRACE.get(thread, [])}
+
+
+@app.get("/api/agui/mode")
+def agui_mode() -> dict:
+    """Which agent the console is actually talking to.
+
+    Worth surfacing: a console that silently ran the agent in-process would
+    look identical to one driving the deployment, and would prove nothing.
+    """
+    cfg = settings()
+    return {"mode": "remote" if cfg.agent_runtime_arn else "local",
+            "runtime_arn": cfg.agent_runtime_arn or None,
+            "qualifier": cfg.agent_qualifier}
