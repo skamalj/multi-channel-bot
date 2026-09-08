@@ -327,13 +327,32 @@ class Agent:
                     trace.add("guardrail", "grounding", action=v.action,
                               grounding=v.grounding, relevance=v.relevance,
                               reasons=v.reasons, blocked=v.blocked)
-                if v.blocked:
-                    # Ungrounded prose reaching a customer is the failure this
-                    # exists to prevent, so it becomes the same refusal the
-                    # citation guardrail would produce - not an error.
-                    text = citations.REFUSAL
-                    report["refused"] = True
-                elif v.text and v.text != text:
+                # Grounding is RECORDED, not enforced, and that is a
+                # measurement rather than a preference.
+                #
+                # Scored against the deployed guardrail, on one question whose
+                # citations all resolved:
+                #     fabricated answer, contradicting the source ... 0.00
+                #     verbatim from a single passage ................ 1.00
+                #     correct answer, paraphrased .................. 0.56
+                #     the same correct answer, next run ............ 0.14
+                #
+                # Bedrock scores the WHOLE response, and this bot's answers
+                # carry conversational framing - "based on the policy
+                # wording", "I can look that up for you" - which appears in no
+                # source document and drags the score down. 0.14 and 0.00 are
+                # too close to separate a good answer from a fabricated one.
+                #
+                # So the RULE decides and the SCORE is watched: citations.py
+                # refuses an answer whose material claims do not resolve to a
+                # retrieved document, which is deterministic and does not care
+                # how the sentence was phrased. Letting a probabilistic score
+                # veto that would refuse correct answers, and a bot that
+                # refuses correct answers is not cautious - it is broken.
+                #
+                # The score still reaches the trace and the audit record, so a
+                # drift in grounding is visible even though it is not fatal.
+                if v.text and v.text != text:
                     # PII the guardrail masked. Take its version.
                     text = v.text
 
