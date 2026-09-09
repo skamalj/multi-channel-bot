@@ -41,7 +41,17 @@ from app.memory.checkpoint import bot_checkpointer
 from app.obs.trace import Trace
 from app.resolver.spec import AgentSpec
 
-MAX_TOOL_ROUNDS = 3
+# How many times a turn may go back to the model to call another tool.
+#
+# 3 was too tight for a question a customer actually asks. "Give me a
+# comparison of these 3 so I can choose" needs one retrieval per product and
+# a round to write the answer, which is the limit exactly - so with any
+# history behind it the turn ran out and the customer got a handoff instead
+# of a comparison, having done nothing wrong.
+#
+# The limit exists to stop a model looping on a tool that keeps failing, and
+# 10 still stops that. It costs latency in the worst case, not correctness.
+MAX_TOOL_ROUNDS = 10
 RETRIEVAL_TOOLS = {"kb_search_health", "kb_search_motor"}
 KNOWN_FACTS_KEPT = 4
 
