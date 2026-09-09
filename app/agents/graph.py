@@ -36,7 +36,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import citations, guardrail, reduce as reducer
+from app.agents import citations, confirm, guardrail, reduce as reducer
 from app.mcpserver.registry import get_tool as spec_for_tool
 from app.agents.state import BotState
 from app.config import settings
@@ -449,9 +449,18 @@ class Agent:
                     "try_instead": self._open_tools()}
 
         if spec.effect in ("write", "dispatch"):
+            # The key is the CALL, not the message.
+            #
+            # It used to be `confirm.token_for(tool, args)` on the confirmed
+            # path, and when that path was deleted the key silently fell back
+            # to the turn's message id - a different value every turn, so the
+            # same quote agreed to twice would have been written twice. The
+            # customer changing their mind and asking again is exactly the
+            # retry this exists to absorb, and the thing that makes two
+            # requests one operation is that the arguments are identical.
+            ctx = ctx | {"idempotency_key": confirm.token_for(name, args)}
             trace.add("gate", f"{spec.effect} {name}",
-                      idempotency_key=ctx.get("idempotency_key"),
-                      confirmed=ctx.get("confirmed", False),
+                      idempotency_key=ctx["idempotency_key"],
                       idempotent=spec.idempotent)
 
         call_args = self._inject(spec, args, ctx)

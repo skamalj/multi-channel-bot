@@ -210,88 +210,77 @@ def test_03_a_partial_answer_is_followed_up_not_refused(journey):
     _not_refused(turn, "asking for a missing detail is not a claim")
 
 
-def _check_parked_quote(turn: dict) -> bool:
-    """If a quote was proposed this turn, was it proposed HONESTLY?
+def _put_to_the_customer(turn: dict) -> bool:
+    """Did this reply put the quote to the customer before running it?
 
-    Returns whether one was parked. Not every run parks it on the same turn -
-    the model sometimes lists the eligible products first - and asserting a
-    turn number would make this fail for a reason that is not a fault. What
-    must hold whenever a quote IS proposed: the arguments match what the
-    customer actually said, and every one of them is visible in the question
-    put to them. A confirmation that hides a field is not a confirmation of
-    the call that will run.
+    There is no gate event to look for any more. Asking used to be a branch
+    in the graph that intercepted the call and wrote the question itself, so
+    the evidence was a `confirmation_required` trace event; asking is the
+    model's job now, so the evidence is the reply. Which is the better test
+    of the property anyway - a trace event proved the machinery fired, not
+    that the customer was told anything useful.
+
+    What must hold: the values are in front of them, and it is a question.
     """
-    gate = Journey.detail(turn, "quote_create_health")
-    if not gate.get("token"):
+    reply = turn["reply"]
+    if "?" not in reply:
         return False
-
-    args = gate.get("args") or {}
-    assert args.get("sum_insured") == 1000000, Journey.report(turn)
-    assert str(args.get("city", "")).lower() == "pune", Journey.report(turn)
-    assert args.get("member_ages") == [43], (
-        "the age the customer just gave did not reach the tool call\n"
-        + Journey.report(turn))
-    for value in ("1000000", "43"):
-        assert value in turn["reply"], (
-            f"the confirmation hides {value!r}\n" + Journey.report(turn))
-    assert "pune" in turn["reply"].lower(), Journey.report(turn)
-    return True
+    shown = sum(v in reply for v in ("10,00,000", "1000000", "10 lakh"))
+    return bool(shown) and "43" in reply
 
 
 def test_04_the_age_completes_the_picture(journey):
-    """AG-6. A quote is a state change. Whether it is proposed on this turn
-    or the next, it may not simply happen."""
+    """AG-6. A quote is a state change: it may not simply happen."""
     turn = journey.say("43")
     _answered(turn)
     _not_refused(turn, "giving an age is not a claim about cover")
-    _check_parked_quote(turn)
     assert not Journey.detail(turn, "write quote_create_health"), (
         "a quote was created without being put to the customer first\n"
         + Journey.report(turn))
 
 
-def test_05_yes_creates_the_quote(journey):
-    """The consent path, read by a model rather than by a regex anchored on
-    the first word of the reply.
-
-    Says yes until the quote exists, at most twice: if the previous turn
-    listed products rather than proposing one, the first yes proposes and the
-    second confirms. Every proposal on the way is checked.
+def test_05_yes_creates_the_quote_and_only_after_being_asked(journey):
+    """The property, not the machinery: the turn before the write has to
+    have put it to the customer, and the write has to carry a key derived
+    from the CALL so agreeing twice writes once.
     """
     reply = "yes"
     for _ in range(4):
+        before = journey.turns[-1]
         turn = journey.say(reply)
         _answered(turn)
         _not_refused(turn, "consent was given for exactly what was proposed")
 
-        # A CONFIRMED tool does not run through the tools node - the pending
-        # node runs it directly, having held it since last turn, and traces
-        # "write <tool>". Looking only at tool events missed the one path
-        # this test exists to check.
-        if Journey.detail(turn, "write quote_create_health") \
-                or "quote_create_health" in turn["tools"]:
-            answer = Journey.detail(turn, "confirmation_answer")
-            assert answer.get("answer") == "yes", (
-                "a plain yes was not read as consent\n"
-                + Journey.report(turn))
+        write = Journey.detail(turn, "write quote_create_health")
+        if write or "quote_create_health" in turn["tools"]:
+            assert _put_to_the_customer(before), (
+                "the quote ran on a turn that was never put to the "
+                "customer\n" + Journey.report(before))
             assert "Q-" in turn["reply"], (
                 "the quote ran but no reference reached the customer\n"
                 + Journey.report(turn))
+            assert write.get("idempotency_key"), Journey.report(turn)
+            journey.quote_key = write["idempotency_key"]
             return
 
-        if _check_parked_quote(turn):
-            reply = "yes"                    # it proposed; confirm it
-        else:
-            # It asked something reasonable instead - most often which of the
-            # three products to quote. Answering that is the journey, and a
-            # test that only ever says "yes" would call a sensible question a
-            # failure. Everything it could still be missing is restated,
-            # which is what a customer asked twice actually does.
-            reply = ("Protec Health Secure please, for myself, age 43, in "
-                     "Pune, sum insured 10 lakh")
+        reply = ("Protec Health Secure please, for myself, age 43, in "
+                 "Pune, sum insured 10 lakh")
 
     pytest.fail("four turns in and still no quote\n"
                 + Journey.report(journey.turns[-1]))
+
+
+def test_05b_asking_again_does_not_create_a_second_quote(journey):
+    """A customer repeating themselves is the retry idempotency exists for.
+    The key is the call, so the same arguments write once."""
+    turn = journey.say("can you create that quote again please")
+    _answered(turn)
+    write = Journey.detail(turn, "write quote_create_health")
+    if not write:
+        return          # it simply repeated the quote it already had
+    assert write["idempotency_key"] == getattr(journey, "quote_key", None), (
+        "the same quote was written under a different key\n"
+        + Journey.report(turn))
 
 
 def test_06_a_vague_follow_up_is_answered_or_asked_about(journey):

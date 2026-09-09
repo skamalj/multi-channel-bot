@@ -103,3 +103,44 @@ def test_the_graph_is_bounded_by_the_frameworks_limit():
                  "recursion_limit": 8})
     finally:
         agent.llm = original
+
+
+def test_the_idempotency_key_is_the_call_not_the_turn():
+    """A quote agreed to twice is one quote.
+
+    The key used to be set on the confirmed path, and when that path was
+    deleted it fell back to the turn's message id - a different value every
+    turn, so asking again would have written again. A customer repeating
+    themselves is precisely the retry this absorbs.
+    """
+    from app.agents.graph import agent_for
+    from app.agents.registry import BOT_05
+    from app.obs.trace import Trace
+
+    agent = agent_for(BOT_05)
+    args = {"product_id": "PHS", "sum_insured": 500000,
+            "member_ages": [40], "city": "Pune"}
+    ctx = {"persona": "customer", "lob": "health", "authenticated": True,
+           "customer_id": "C-10001", "user_id": "u-idem",
+           "consent": {"quotation": True}}
+
+    keys = []
+    for message_id in ("msg-1", "msg-2"):
+        trace = Trace()
+        agent._run_tool("quote_create_health", args,
+                        ctx | {"idempotency_key": message_id}, trace)
+        writes = [e for e in trace.events
+                  if e.kind == "gate" and e.label.startswith("write")]
+        keys.append(writes[0].detail["idempotency_key"])
+
+    assert keys[0] == keys[1], (
+        "two turns produced two keys, so the same quote would be written "
+        f"twice: {keys}")
+
+    # A different argument is a different operation.
+    trace = Trace()
+    agent._run_tool("quote_create_health", args | {"sum_insured": 1000000},
+                    ctx | {"idempotency_key": "msg-3"}, trace)
+    other = [e for e in trace.events
+             if e.kind == "gate" and e.label.startswith("write")][0]
+    assert other.detail["idempotency_key"] != keys[0]
