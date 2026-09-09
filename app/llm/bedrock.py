@@ -10,19 +10,14 @@ because each one replaced a pattern that got language wrong:
 
 * `classify_lob` routes a turn to health or motor. It used to be a keyword
   list at 0.95 confidence with the model kept as a last resort.
-* `read_confirmation` decides whether a customer consented. It used to be two
-  regexes anchored on the first word, and "ok but not the payment" was read
-  as consent to take the payment.
 * `asked_for_a_person` decides whether somebody asked for a human. It used to
   be a word list that did not match "can I speak with somebody".
 * `score_relevance` is the drop-in for a real cross-encoder.
 
 They do not fail the same way, and the difference is deliberate.
-`read_confirmation` fails to "unclear", because a transaction must not
-execute because an endpoint was slow. `classify_lob` fails to "no opinion",
-which routes to a question rather than a guess. `asked_for_a_person` fails to
-YES, because making somebody argue their way out of a bot is the wrong place
-to be strict.
+`classify_lob` fails to "no opinion", which routes to a question rather than
+a guess. `asked_for_a_person` fails to YES, because making somebody argue
+their way out of a bot is the wrong place to be strict.
 
 `MOCK_LLM=1` swaps in a scripted stub so the whole pipeline - resolver,
 binding, tools, gates, citations - runs with no credentials at all.
@@ -347,90 +342,6 @@ def score_relevance(query: str, passages: list[dict]) -> dict[str, float]:
     scores = _json_from(str(content)).get("scores", {})
     return {k: float(v) for k, v in scores.items()
             if isinstance(v, (int, float))}
-
-
-_CONFIRM_PROMPT = """A customer was asked to confirm an action - issuing a \
-policy, taking a payment, registering a claim. Decide what their reply means.
-
-YES only if they agreed to that action, as it was put to them, with no \
-condition, no change and no question attached.
-NO if they declined, or asked to stop or wait.
-UNCLEAR for anything else: a question, a hedge, a request to change something \
-first, agreement to only part of it, or two minds in one sentence.
-
-"ok but not the payment" is UNCLEAR - they agreed to some of it.
-"yes, but change the sum insured first" is UNCLEAR - they want something else.
-"ok what does it cost?" is UNCLEAR - that is a question, not consent.
-
-Customers here write in English, Hindi, or Hindi in Latin letters, and often mix them in one sentence. "haan bhai kar do" and "theek hai karo" are plain agreement - YES. Judge what they meant, not which language they used.
-
-Reply with one word: YES, NO or UNCLEAR."""
-
-
-def read_confirmation(text: str | None) -> str:
-    """Did the customer consent to the action we described? AG-6.
-
-    This replaced two regexes, and they were the most dangerous patterns in
-    the system - they decided consent for policy_issue, payment_collect and
-    claim_register by matching the FIRST word of the reply:
-
-        "ok but not the payment"                  -> yes, took the payment
-        "yes, but change the sum insured first"   -> yes, at the old figure
-        "sure, wait - actually no"                -> yes
-        "ok what does it cost?"                   -> yes, instead of answering
-        "confirm the ages first please"           -> yes (matched "confirm")
-
-    Fails CLOSED, unlike every other model call here. An unavailable model
-    returns "unclear", which asks the customer again. Failing open would
-    mean a transaction executing because an endpoint was slow.
-    """
-    t = (text or "").strip()
-    if not t:
-        return "unclear"
-
-    cfg = settings()
-    if cfg.mock_llm or cfg.no_aws:
-        return _stub_confirmation(t)
-
-    try:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        # The main model, not the small one. This decides whether money
-        # moves; it is not the place to save a fraction of a cent.
-        resp = get_llm(guardrail=False).invoke([
-            SystemMessage(content=_CONFIRM_PROMPT),
-            HumanMessage(content=t[:1000])])
-        content = resp.content
-        if isinstance(content, list):
-            content = " ".join(b.get("text", "") for b in content
-                               if isinstance(b, dict))
-        word = str(content).strip().lower()
-        if word.startswith("yes"):
-            return "yes"
-        if word.startswith("no"):
-            return "no"
-        return "unclear"
-    except Exception as exc:                                 # noqa: BLE001
-        log.warning("could not read the confirmation, asking again: %s",
-                    type(exc).__name__)
-        return "unclear"
-
-
-def _stub_confirmation(text: str) -> str:
-    """Offline stand-in for the model, and a stub is all it is.
-
-    It runs only under MOCK_LLM/NO_AWS, where there is no model to ask. It is
-    deliberately literal - whole reply, nothing else - so that it cannot be
-    mistaken for the production rule and quietly become one again.
-    """
-    t = " ".join(text.lower().replace(",", " ").replace(".", " ").split())
-    if t in {"y", "yes", "yes please", "ok", "okay", "go ahead", "confirm",
-             "proceed", "do it", "haan", "haan ji"}:
-        return "yes"
-    if t in {"n", "no", "no thanks", "nope", "cancel", "stop", "not now",
-             "nahi", "never mind"}:
-        return "no"
-    return "unclear"
 
 
 def _registration_like(text: str) -> str | None:

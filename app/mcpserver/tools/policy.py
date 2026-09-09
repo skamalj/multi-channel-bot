@@ -141,7 +141,11 @@ CONSENT_PURPOSES = {
 
 @tool(tags={"lob": "health|motor", "persona": "customer|agent"},
       effect="write", authority="none", auth="none", idempotent=True,
-      choices={"purpose": sorted(CONSENT_PURPOSES)})
+      choices={"purpose": sorted(CONSENT_PURPOSES)},
+      params={"purpose": "What the customer is agreeing to. One of"
+                         " 'quotation', 'kyc' or 'payment' - the same purpose"
+                         " named in the consent_required error you are"
+                         " responding to."})
 def consent_grant(purpose: str, _user_id: str | None = None) -> dict:
     """Record that the customer agreed to something being done for them.
 

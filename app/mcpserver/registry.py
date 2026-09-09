@@ -54,6 +54,12 @@ class ToolSpec:
     # product id it has to recall is a product id it will invent, and the
     # customer is then asked to confirm a call that cannot succeed.
     choices: dict[str, Callable[[], list]] = field(default_factory=dict)
+    # What each parameter IS, in the model's terms - units, format, and what
+    # happens if it is wrong. The signature gives a type and whether it is
+    # required; it cannot say that `idv` is in rupees or that `as_of` is the
+    # policy start date. A model guessing at a parameter is a model sending
+    # lakhs where rupees were meant.
+    params: dict[str, str] = field(default_factory=dict)
 
     @property
     def signature(self) -> str:
@@ -69,7 +75,8 @@ def tool(*, tags: dict[str, str], effect: Effect = "read",
          auth: str = "anonymous", subject: str = "none",
          confirm: bool | None = None,
          idempotent: bool | None = None,
-         choices: dict[str, Callable[[], list]] | None = None) -> Callable:
+         choices: dict[str, Callable[[], list]] | None = None,
+         params: dict[str, str] | None = None) -> Callable:
     def deco(fn: Callable) -> Callable:
         mutating = effect in ("write", "dispatch")
         _TOOLS[fn.__name__] = ToolSpec(
@@ -88,6 +95,7 @@ def tool(*, tags: dict[str, str], effect: Effect = "read",
             confirm=mutating if confirm is None else confirm,
             idempotent=mutating if idempotent is None else idempotent,
             choices=choices or {},
+            params=params or {},
         )
         return fn
 
@@ -157,6 +165,13 @@ def json_schema(spec: ToolSpec) -> dict:
             continue
         ann = hints.get(name, str)
         props[name] = _json_type(ann)
+        optional = p.default is not inspect.Parameter.empty
+        described = spec.params.get(name)
+        if described:
+            props[name]["description"] = (
+                described + (" Optional." if optional else " Required."))
+        elif optional:
+            props[name]["description"] = "Optional."
         if name in spec.choices:
             try:
                 values = list(spec.choices[name]())

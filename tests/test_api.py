@@ -193,43 +193,31 @@ def test_a_customer_asking_for_commission_gets_no_such_tool(client):
 
 
 def test_a_write_tool_is_refused_without_consent(client):
-    """AG-5: the server check runs whatever the client bound."""
-    data = _say(client, CUSTOMER, "I want a health quote for my family")
-    _say(client, CUSTOMER, "yes")
-    gates = [e for e in _events(data, "gate")]
-    assert any("confirmation_required" in g["label"] for g in gates)
+    """AG-5: the server check runs whatever the client bound, and a consent
+    refusal is a refusal the CUSTOMER can lift.
 
+    This used to assert on a `confirmation_required` gate - the parking
+    mechanism that intercepted the call and wrote the question into the
+    conversation itself. Asking is the model's job now, so what is left to
+    check here is the part that is not the model's job: a write with no
+    consent behind it does not run.
+    """
+    from app.agents.graph import agent_for
+    from app.agents.registry import BOT_05
+    from app.obs.trace import Trace
+
+    out = agent_for(BOT_05)._run_tool(
+        "quote_create_health",
+        {"product_id": "PHS", "sum_insured": 500000,
+         "member_ages": [40], "city": "Pune"},
+        {"persona": "customer", "lob": "health", "authenticated": True,
+         "customer_id": "C-10001", "user_id": CUSTOMER, "consent": {}},
+        Trace())
+    assert out["error"] == "consent_required"
+    assert out["purpose"] == "quotation"
+    assert "consent_grant" in out["try_instead"]
 
 # --- confirmation and idempotency -----------------------------------------
-def test_a_mutating_call_is_proposed_then_performed_once(client):
-    """AG-6 end to end: propose, confirm, execute - and the second identical
-    confirmation returns the first result rather than writing again."""
-    client.post("/api/consent", json={"user_id": CUSTOMER,
-                                      "purpose": "quotation", "granted": True})
-    proposed = _say(client, CUSTOMER, "please give me a health quote")
-    gate = [g for g in _events(proposed, "gate")
-            if g["label"].startswith("confirmation_required")][0]
-    assert "Shall I go ahead?" in _reply(proposed)
-    token = gate["detail"]["token"]
-
-    done = _say(client, CUSTOMER, "yes")
-    answer = _events(done, "gate", "confirmation_answer")[0]["detail"]
-    assert answer["answer"] == "yes" and answer["token"] == token
-    tool_calls = _events(done, "tool")
-    assert tool_calls and tool_calls[0]["label"] == "quote_create_health"
-    assert tool_calls[0]["detail"]["effect"] == "write"
-
-
-def test_declining_a_confirmation_performs_nothing(client):
-    client.post("/api/consent", json={"user_id": CUSTOMER,
-                                      "purpose": "quotation", "granted": True})
-    _say(client, CUSTOMER, "please give me a health quote")
-    data = _say(client, CUSTOMER, "no thanks")
-    assert _events(data, "tool") == []
-    assert "have not done that" in _reply(data)
-
-
-# --- audit and erasure -----------------------------------------------------
 def test_the_audit_record_spans_every_line_of_business(client):
     """OB-3. Separation governs runtime context, not the record."""
     _say(client, CUSTOMER, "what is my health waiting period")
@@ -315,50 +303,3 @@ def test_a_customer_turn_searches_only_the_public_corpus(client):
             assert not c["chunk_id"].startswith("M-COMM-GRID")
 
 
-def test_a_confirmation_prompt_is_not_replayed_to_the_model(client):
-    """AG-6's sharpest edge, found by walking an issuance in the console.
-
-    The confirmation prompt is written by `confirm.py`, not by the model.
-    Replaying it as an assistant message teaches the pattern, and the model
-    starts writing "I am about to issue the policy. Shall I go ahead?"
-    INSTEAD of calling the tool - so the customer says yes, nothing is
-    parked, and the journey stalls with the bot describing an action it
-    never took.
-    """
-    from langchain_core.messages import AIMessage, HumanMessage
-
-    from app.agents.graph import model_visible
-
-    history = [
-        HumanMessage(content="issue my policy"),
-        AIMessage(content="I am about to issue the policy. Shall I go ahead?",
-                  additional_kwargs={"system_authored": True}),
-        HumanMessage(content="yes"),
-        AIMessage(content="Your policy is issued."),
-    ]
-    visible = model_visible(history)
-    assert len(visible) == 3
-    assert not any("about to issue" in str(m.content) for m in visible)
-    # The customer saw it, so it stays in the transcript and the audit record.
-    assert len(history) == 4
-
-
-def test_a_parked_confirmation_survives_into_the_next_turn(client):
-    """The whole flow: propose, park, confirm, execute - through HTTP."""
-    client.post("/api/consent", json={"user_id": CUSTOMER,
-                                      "purpose": "quotation", "granted": True})
-    proposed = _say(client, CUSTOMER, "please give me a health quote")
-    assert "Shall I go ahead?" in _reply(proposed)
-
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
-    from app.orchestrator import bot_thread
-
-    snapshot = agent_for(BOT_05).graph.get_state(
-        {"configurable": {"thread_id": bot_thread(CUSTOMER, "health")}})
-    assert snapshot.values.get("pending_confirmation"), "nothing was parked"
-
-    done = _say(client, CUSTOMER, "yes")
-    answered = _events(done, "gate", "confirmation_answer")
-    assert answered and answered[0]["detail"]["answer"] == "yes"
-    assert [e["label"] for e in _events(done, "tool")] == ["quote_create_health"]

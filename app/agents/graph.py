@@ -4,20 +4,25 @@ A compiled `StateGraph` per configuration, with the bot checkpointer behind
 it. LangGraph owns the thread: `thread_id = user#lob`, and persistence,
 message reduction and state history come with it.
 
-    entry ─ reduce ─┬─ pending ─┬─ END          (declined, or asked again)
-                    │           └─ model        (confirmed: the tool ran)
-                    └─ model ─┬─ tools ── model (up to MAX_TOOL_ROUNDS)
-                              └─ respond ── END
+    entry ─ reduce ─ model ─┬─ tools ─ model
+                            └─ respond ── END
 
-**No interrupts anywhere, and that is unchanged by using a graph.** Every
-invocation runs start to finish in one turn. A confirmation the customer has
-not given yet is a FIELD in the checkpointed state (`pending_confirmation`),
-read by the entry node on the next turn - not a parked execution. On Lambda
-there is nothing to park, and `interrupt()` would re-run the whole node on
-resume, firing any send inside it twice.
+**Nothing here writes in the bot's voice.** Every word the customer reads is
+the model's, and the graph's job is to bound the thread, run tools, and check
+what came back. There used to be three sentences composed in code - a
+confirmation prompt, a decline, a handoff - injected into the conversation
+and then filtered back out again before the model could see them. That is
+gone: the instructions are in `prompts/`, and asking before a write is
+something the model does because the prompt and the tool descriptions say so.
 
-Checkpointing and interrupts are independent features. Taking the first and
-declining the second is the whole design here.
+**Nothing here trims the message list either.** The reducer owns the history
+- pruning, summarising, and keeping tool calls with their results. A second
+window applied at call time cut through those pairs and Bedrock rejected the
+turn.
+
+**No interrupts anywhere.** Every invocation runs start to finish in one
+turn. On Lambda there is nothing to park, and `interrupt()` would re-run the
+whole node on resume, firing any send inside it twice.
 
 **Tools are bound once, at graph construction.** An agent IS its tag set,
 which is what makes `capability_matrix()` printable without simulating a
@@ -31,7 +36,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import citations, confirm, guardrail, reduce as reducer
+from app.agents import citations, guardrail, reduce as reducer
 from app.mcpserver.registry import get_tool as spec_for_tool
 from app.agents.state import BotState
 from app.config import settings
@@ -41,17 +46,20 @@ from app.memory.checkpoint import bot_checkpointer
 from app.obs.trace import Trace
 from app.resolver.spec import AgentSpec
 
-# How many times a turn may go back to the model to call another tool.
+# There is no round counter here any more, and no node that exists to end a
+# turn the counter cut short.
 #
-# 3 was too tight for a question a customer actually asks. "Give me a
-# comparison of these 3 so I can choose" needs one retrieval per product and
-# a round to write the answer, which is the limit exactly - so with any
-# history behind it the turn ran out and the customer got a handoff instead
-# of a comparison, having done nothing wrong.
+# LangGraph already bounds a graph: `recursion_limit` in the invoke config,
+# raising GraphRecursionError when the loop will not settle. Counting rounds
+# ourselves meant routing PAST the tools node once the count was reached,
+# which left the model's tool calls unexecuted and therefore unanswered - the
+# orphaned pair Bedrock rejects on the next turn - and then a second piece of
+# machinery to answer them, and a third to write the customer a sentence
+# because the graph had left the model nothing to say. All of that was
+# working around a limit the framework already enforces properly.
 #
-# The limit exists to stop a model looping on a tool that keeps failing, and
-# 10 still stops that. It costs latency in the worst case, not correctness.
-MAX_TOOL_ROUNDS = 10
+# See app/config.py graph_recursion_limit and the orchestrator, which catches
+# the error the framework raises.
 RETRIEVAL_TOOLS = {"kb_search_health", "kb_search_motor"}
 KNOWN_FACTS_KEPT = 4
 
@@ -62,13 +70,7 @@ KNOWN_FACTS_KEPT = 4
 # depends on a model reading an instruction is not a control.
 #
 # The exception is the customer asking for a person, and whether they asked is
-# decided by a model - see asked_for_a_person in app/llm/bedrock.py. It used to
-# be a word list, which does not match "can I speak WITH SOMEBODY", so that
-# customer was made to wait while the bot searched. Making somebody argue their
-# way out of a bot is the wrong place to be strict.
-HANDOFF = ("I could not complete that in a reasonable number of steps, and I "
-           "would rather not keep you guessing. Let me put you through to a "
-           "colleague who can pick this up with everything you have told me.")
+# decided by a model - see asked_for_a_person in app/llm/bedrock.py.
 
 
 def _tool_schemas(spec: AgentSpec) -> list[dict]:
@@ -106,21 +108,16 @@ class Agent:
         g = StateGraph(BotState)
         g.add_node("entry", self._entry)
         g.add_node("reduce", self._reduce)
-        g.add_node("pending", self._pending)
         g.add_node("model", self._model)
         g.add_node("tools", self._tools)
         g.add_node("respond", self._respond)
 
         g.add_edge(START, "entry")
         g.add_edge("entry", "reduce")
-        g.add_conditional_edges("reduce", self._after_entry,
-                                {"pending": "pending", "model": "model"})
-        g.add_conditional_edges("pending", self._after_pending,
-                                {"model": "model", "end": END})
+        g.add_edge("reduce", "model")
         g.add_conditional_edges("model", self._after_model,
                                 {"tools": "tools", "respond": "respond"})
-        g.add_conditional_edges("tools", self._after_tools,
-                                {"model": "model", "end": END})
+        g.add_edge("tools", "model")
         g.add_edge("respond", END)
         return g.compile(checkpointer=bot_checkpointer())
 
@@ -145,7 +142,7 @@ class Agent:
                 blocked = v.blocked
         return {"rounds": 0, "retrieved": [], "tool_facts": [],
                 "tools_called": [], "used_core_tool": False,
-                "looked_up": False, "parked": False, "last_citations": [],
+                "looked_up": False, "last_citations": [],
                 "inbound_blocked": blocked}
 
     def _reduce(self, state: BotState, config) -> dict:
@@ -159,75 +156,6 @@ class Agent:
         _, trace = _turn(config)
         return reducer.reduce_thread(dict(state), trace)
 
-    def _after_entry(self, state: BotState) -> str:
-        return "pending" if confirm.pending_of(dict(state)) else "model"
-
-    def _pending(self, state: BotState, config) -> dict:
-        """AG-6. The customer's answer to a call we proposed last turn."""
-        ctx, trace = _turn(config)
-        pending = confirm.pending_of(dict(state))
-        answer = confirm.read_answer(_last_human_text(state))
-        trace.add("gate", "confirmation_answer", answer=answer,
-                  tool=pending["tool"], token=pending["token"])
-
-        if answer == "no":
-            return {"pending_confirmation": None,
-                    "messages": [_system_msg(
-                        "No problem - I have not done that. What would you "
-                        "like to do instead?")]}
-        if answer == "unclear":
-            # The customer said something that is not yes and not no - which
-            # usually means they asked something else. Let the turn carry on
-            # to the model, and leave the confirmation parked so they can
-            # still say yes afterwards.
-            #
-            # This used to answer with the confirmation prompt again and end
-            # the turn. Every message was then read ONLY as an answer to the
-            # pending question, so "what is copayment?" came back as "I am
-            # about to create a health quote - shall I go ahead?", and so did
-            # the next question, and the next. The customer could not change
-            # the subject until they said yes, said no, or waited out the
-            # 30-minute expiry. A confirmation is a question the bot asked;
-            # it is not permission to stop listening.
-            return {}
-
-        # The token IS the idempotency key: the same operation confirmed
-        # twice returns the first result rather than writing again.
-        result = self._run_tool(
-            pending["tool"], pending["args"],
-            ctx | {"confirmed": True, "idempotency_key": pending["token"]},
-            trace)
-        # A tool RESULT with no matching tool CALL is not a conversation the
-        # Converse API accepts, and it is not one that happened either: the
-        # model proposed this last turn and we deferred it. Replay the pair.
-        return {
-            "pending_confirmation": None,
-            "used_core_tool": True,
-            "tool_facts": [json.dumps(result, default=str)],
-            "tools_called": [pending["tool"]],
-            "messages": [
-                AIMessage(content="", tool_calls=[{
-                    "name": pending["tool"], "args": pending["args"],
-                    "id": pending["token"]}]),
-                ToolMessage(content=json.dumps(result, default=str)[:8000],
-                            tool_call_id=pending["token"]),
-            ],
-        }
-
-    def _after_pending(self, state: BotState) -> str:
-        """Where a confirmation turn goes next.
-
-        A ToolMessage means the customer said yes and the tool ran - the
-        model speaks to the result. A human message still being last means
-        the answer was unclear and nothing was written, so the turn carries
-        on as an ordinary one. Anything else is the decline, which is already
-        answered.
-        """
-        last = state["messages"][-1]
-        if isinstance(last, ToolMessage):
-            return "model"
-        return "model" if getattr(last, "type", "") == "human" else "end"
-
     def _model(self, state: BotState, config) -> dict:
         cfg = settings()
         _, trace = _turn(config)
@@ -240,8 +168,8 @@ class Agent:
         #    following Ids: functions.kb_search_health:0"
         # It also fired at half the reducer's threshold, so between the two
         # numbers it was the only thing trimming - blindly.
-        history = model_visible(state["messages"])
-        messages = [SystemMessage(content=self._system_prompt())] + history
+        messages = ([SystemMessage(content=self._system_prompt())]
+                    + list(state["messages"]))
         with trace.timed("llm", f"invoke round {state.get('rounds', 0) + 1}",
                          model="stub" if cfg.mock_llm else cfg.bedrock_model_id,
                          tools_bound=len(self.tool_names)):
@@ -270,11 +198,16 @@ class Agent:
         return {"messages": [ai], "rounds": state.get("rounds", 0) + 1}
 
     def _after_model(self, state: BotState) -> str:
+        """A tool call ALWAYS goes to the tools node.
+
+        It used to go to `respond` once a round counter was reached, which
+        left the calls unexecuted and therefore unanswered - an AI message
+        with tool_calls and no ToolMessage against it, which Bedrock rejects
+        on the next turn. Bounding the loop is `recursion_limit`'s job.
+        """
         last = state["messages"][-1]
         calls = getattr(last, "tool_calls", None) or []
-        if calls and state.get("rounds", 0) < MAX_TOOL_ROUNDS:
-            return "tools"
-        return "respond"
+        return "tools" if calls else "respond"
 
     def _tools(self, state: BotState, config) -> dict:
         ctx, trace = _turn(config)
@@ -303,18 +236,21 @@ class Agent:
                     tool_call_id=call.get("id", name)))
                 continue
 
-            # A mutating tool is PROPOSED, not performed. The customer is
-            # asked, and the answer arrives on the next turn.
-            if spec and spec.confirm and not ctx.get("confirmed"):
-                parked = confirm.park(out, name, args)   # writes into `out`
-                trace.add("gate", f"confirmation_required {name}",
-                          token=parked["token"], args=args)
-                return out | {
-                    "parked": True,
-                    "pending_confirmation": parked,
-                    "messages": [_system_msg(parked["summary"])],
-                }
-
+            # A mutating tool is asked about in the prompt, not parked here.
+            #
+            # This used to intercept the call, write "I am about to create a
+            # motor quote - ncb pct: 20, idv: 1500000" into the conversation
+            # itself and end the turn, holding the arguments in state until
+            # the next message answered yes or no. Three separate mechanisms
+            # to run one tool, and none of them visible to the model - which
+            # is why a quote asked for confirmation three times and nothing
+            # in the code showed that it would.
+            #
+            # The model asks now, in its own words, because the prompt tells
+            # it to and the tool descriptions say which tools change
+            # something. What is still enforced here is the part a sentence
+            # cannot enforce: the idempotency key, so the same call agreed
+            # twice writes once.
             result = self._run_tool(name, args, ctx, trace)
             failed = isinstance(result, dict) and "error" in result
             if spec and spec.effect == "read" and not failed:
@@ -330,70 +266,12 @@ class Agent:
                 tool_call_id=call.get("id", name)))
         return out
 
-    def _after_tools(self, state: BotState) -> str:
-        if state.get("parked"):
-            return "end"
-        if state.get("rounds", 0) >= MAX_TOOL_ROUNDS:
-            return "end"
-        return "model"
-
     def _respond(self, state: BotState, config) -> dict:
         ctx, trace = _turn(config)
         ai = state["messages"][-1]
         text = _text_of(ai)
         retrieved = list(state.get("retrieved") or [])
         tools_called = list(state.get("tools_called") or [])
-
-        pending_calls = getattr(ai, "tool_calls", None) or []
-        if state.get("rounds", 0) >= MAX_TOOL_ROUNDS and pending_calls:
-            trace.add("error", "tool_round_limit", rounds=MAX_TOOL_ROUNDS)
-            args = {"reason": f"tool round limit ({MAX_TOOL_ROUNDS} rounds)",
-                    "summary": (_last_human_text(state) or "")[:200]}
-            result = self._run_tool("human_handoff", args, ctx, trace)
-
-            # Everything below is about what the NEXT turn can see, and it
-            # used to see two wrong things.
-            #
-            # First, the tool calls this turn ran out of budget for were
-            # never answered. `_after_model` routes here instead of to the
-            # tools node, so an AI message carrying tool_calls was left in
-            # the thread with no ToolMessage against it - the orphaned pair
-            # Bedrock rejects outright on the next turn. Every one of them is
-            # answered now, truthfully: it did not run, and why.
-            #
-            # Second, the handoff itself left no trace the model could read.
-            # The customer-facing message is system_authored, so the model
-            # never saw it, and on the next turn it invented a reason for the
-            # conversation having stopped - "I have already searched the
-            # approved sources and no product information was found", which
-            # was not true and which then poisoned every turn after it.
-            # Recording the call and its result means the model knows a
-            # colleague is already involved and can say so, instead of
-            # guessing. A handoff should not interrupt the conversation.
-            handoff_id = "handoff-round-limit"
-            messages: list[Any] = [
-                ToolMessage(
-                    tool_call_id=call.get("id") or call.get("name", "tool"),
-                    content=json.dumps({
-                        "error": "tool_round_limit",
-                        "detail": (f"this turn reached its limit of "
-                                   f"{MAX_TOOL_ROUNDS} tool rounds, so this "
-                                   f"call was not made"),
-                    }))
-                for call in pending_calls
-            ]
-            messages += [
-                AIMessage(content="", tool_calls=[{
-                    "name": "human_handoff", "args": args, "id": handoff_id}]),
-                ToolMessage(tool_call_id=handoff_id,
-                            content=json.dumps(result, default=str)[:8000]),
-                _system_msg(HANDOFF),
-            ]
-            return {"messages": messages,
-                    "tools_called": ["human_handoff"],
-                    "tool_facts": [json.dumps(result, default=str)],
-                    "last_tools": tools_called + ["human_handoff"],
-                    "last_citations": []}
 
         # Facts this journey established count as established.
         known = " ".join(list(state.get("known_facts") or [])
@@ -637,63 +515,6 @@ class Agent:
             f"prompt_version={cfg.prompt_version} "
             f"config_version={cfg.config_version}"
         )
-
-
-def _system_msg(text: str) -> AIMessage:
-    """A message the SYSTEM wrote in the bot's voice.
-
-    The customer sees it and the audit records it, but it is kept out of the
-    model's own context - replaying a confirmation prompt as the model's
-    prior output teaches it to write that sentence instead of calling the
-    tool.
-    """
-    return AIMessage(content=text,
-                     additional_kwargs={"system_authored": True})
-
-
-def model_visible(messages) -> list:
-    """History minus the messages the SYSTEM wrote in the bot's voice.
-
-    A confirmation prompt - "I am about to issue the policy. Shall I go
-    ahead?" - is generated by `confirm.py`, not by the model. Replaying it as
-    an assistant message teaches the model the pattern, and it starts writing
-    that sentence INSTEAD of calling the tool. The customer then says "yes",
-    nothing is parked to confirm, and the journey stalls with the bot
-    politely describing an action it never took.
-
-    The guardrail's block message is filtered on its TEXT as well as on the
-    marker, and that is not belt-and-braces - marking it when the guardrail
-    fires is not enough. Bedrock returns the block message as the assistant's
-    own content. Once one is in the history unmarked, the model reads it as
-    something it said and writes it again on the next turn - and that copy
-    arrives with no intervention to detect, so it is stored unmarked too. The
-    thread refuses everything from then on with nothing blocking it, which is
-    exactly how it presented: a block message and an empty guardrail trace.
-    Matching the text breaks the loop and heals threads already carrying it.
-
-    This is a comparison against one configured string, not a judgement about
-    language - the wording comes from the guardrails stack precisely so there
-    is only one copy of it.
-
-    Those messages stay in the checkpoint and in the audit record. They are
-    simply not shown back to the model as its own prior output.
-    """
-    blocked = _norm_text(settings().guardrail_blocked_message)
-    out = []
-    for m in messages:
-        if getattr(m, "additional_kwargs", {}).get("system_authored"):
-            continue
-        if blocked and getattr(m, "type", "") == "ai" and \
-                _norm_text(_text_of(m)) == blocked:
-            continue
-        out.append(m)
-    return out
-
-
-def _norm_text(s: str) -> str:
-    """Compare on words. YAML folding and the odd trailing space are not a
-    difference worth failing to recognise the sentence over."""
-    return " ".join((s or "").split()).strip().lower()
 
 
 def _last_human_text(state: BotState) -> str | None:

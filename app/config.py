@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     ddb_audit_table: str = "mcb-audit"
     s3_bucket: str = "mcb-artifacts-CHANGE-ME"
 
+    # LangGraph bounds the graph, not a counter of ours. Super-steps, so one
+    # model/tools round trip costs two: 40 allows a comparison that searches
+    # several products and still stops a loop that will not settle.
+    graph_recursion_limit: int = 40
+
     session_ttl_days: int = 30
     resolver_ttl_days: int = 180
     audit_ttl_days: int = 2555          # 7 years - the record outlives the session
@@ -58,9 +63,7 @@ class Settings(BaseSettings):
 
     guardrail_id: str = ""
     guardrail_version: str = "DRAFT"
-    # Supplied by the guardrails stack, which owns the wording. Empty simply
-    # means the filter below has nothing to match, which is the offline
-    # posture - see model_visible in app/agents/graph.py.
+    # Supplied by the guardrails stack, which owns the wording.
     guardrail_blocked_message: str = ""
 
     # Bedrock Knowledge Base. Empty falls back to the local corpus, which is

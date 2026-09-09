@@ -49,7 +49,21 @@ def product_list_motor(vehicle_class: str | None = None) -> list[dict]:
 @tool(tags={"lob": "health", "persona": "customer|agent"},
       effect="write", authority="core", pii=True, auth="identified",
       consent_purpose="quotation",
-      choices={"product_id": _ids("health"), "addons": _addons("health")})
+      choices={"product_id": _ids("health"), "addons": _addons("health")},
+      params={
+          "product_id": "Which health product to rate. Use product_list_health"
+                        " to see what this customer is eligible for.",
+          "sum_insured": "Cover amount in RUPEES, not lakhs - 10 lakh is"
+                         " 1000000. Must be one of the product's sum insured"
+                         " options.",
+          "member_ages": "Age in years of every person to be covered, one"
+                         " number each, including the proposer. Ages drive"
+                         " both eligibility and the premium.",
+          "city": "The city the policy will be issued in. Premium varies by"
+                  " location.",
+          "addons": "Add-on codes to include, e.g. MAT for maternity. Leave"
+                    " it out for a base quote.",
+      })
 def quote_create_health(product_id: str, sum_insured: int,
                         member_ages: list[int], city: str,
                         addons: list[str] | None = None,
@@ -70,7 +84,20 @@ def quote_create_health(product_id: str, sum_insured: int,
 @tool(tags={"lob": "motor", "persona": "customer|agent"},
       effect="write", authority="core", pii=True, auth="identified",
       consent_purpose="quotation",
-      choices={"product_id": _ids("motor"), "addons": _addons("motor")})
+      choices={"product_id": _ids("motor"), "addons": _addons("motor")},
+      params={
+          "product_id": "Which motor product to rate. Use product_list_motor"
+                        " to see what applies to this vehicle class.",
+          "idv": "Insured Declared Value in RUPEES - the agreed value of the"
+                 " vehicle, which is what a total loss pays out.",
+          "vehicle_age_years": "Whole years since the vehicle was first"
+                               " registered. Loading rises with age.",
+          "ncb_pct": "No Claim Bonus already earned, as a percentage (0, 20,"
+                     " 25, 35, 45 or 50). It discounts the own-damage"
+                     " premium only.",
+          "addons": "Add-on codes to include, e.g. ZD for zero depreciation."
+                    " Leave it out for a base quote.",
+      })
 def quote_create_motor(product_id: str, idv: int, ncb_pct: int,
                        vehicle_age_years: float,
                        addons: list[str] | None = None,

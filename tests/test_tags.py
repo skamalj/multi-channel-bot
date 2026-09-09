@@ -106,11 +106,18 @@ def test_schemas_resolve_real_types_not_strings():
     schema = json_schema(get_tool("quote_create_health"))
     props = schema["properties"]
     assert props["sum_insured"]["type"] == "integer"
-    assert props["member_ages"] == {"type": "array", "items": {"type": "integer"}}
+    assert props["member_ages"]["type"] == "array"
+    assert props["member_ages"]["items"] == {"type": "integer"}
     assert props["city"]["type"] == "string"
     assert "_idempotency_key" not in props          # injected, never modelled
     assert set(schema["required"]) == {"product_id", "sum_insured",
                                        "member_ages", "city"}
+
+    # And each one says what it IS, which a type cannot: the signature
+    # cannot tell a model that a sum insured is in rupees rather than lakhs.
+    assert "rupees" in props["sum_insured"]["description"].lower()
+    assert props["city"]["description"].endswith("Required.")
+    assert props["addons"]["description"].endswith("Optional.")
 
 
 def test_closed_sets_are_in_the_schema_not_in_the_models_memory():

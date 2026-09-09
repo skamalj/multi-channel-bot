@@ -21,6 +21,7 @@ and the trace - travels in `configurable` and is never checkpointed.
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.errors import GraphRecursionError
 
 from app.agents.graph import agent_for
 from app.agents.registry import spec_for
@@ -64,8 +65,7 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
     work_in_flight = False
     if prior_lob:
         prior_state = _bot_state(event.user_id, prior_lob)
-        work_in_flight = bool(prior_state.get("slots")
-                              or prior_state.get("pending_confirmation"))
+        work_in_flight = bool(prior_state.get("slots"))
 
     resolved = resolver.invoke({
         "session": prior.model_dump(),
@@ -110,9 +110,17 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
               consent=sorted(k for k, v in ctx["consent"].items() if v),
               customer_id=ctx["customer_id"], producer_id=ctx["producer_id"])
 
+    # `recursion_limit` is how a graph is bounded. It counts super-steps, so
+    # one model/tools round trip is two, and LangGraph raises
+    # GraphRecursionError rather than letting a loop run forever.
+    #
+    # This replaced a round counter of our own, which bounded the loop by
+    # routing PAST the tools node - leaving the model's calls unexecuted and
+    # unanswered, which is a thread Bedrock rejects on the next turn.
     b_config = {"configurable": {
         "thread_id": bot_thread(event.user_id, spec.lob),
-        "ctx": ctx, "trace": trace}}
+        "ctx": ctx, "trace": trace},
+        "recursion_limit": settings().graph_recursion_limit}
 
     # RS-9: a persona switch carries no journey state. The thread is the
     # person and the line of business, so the switch clears it rather than
@@ -145,7 +153,15 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
         # The ONLY thing that crosses a compartment boundary.
         "shared": session.profile.model_dump(),
     }
-    state = agent.graph.invoke(inputs, b_config)   # bot checkpoint FIRST
+    try:
+        state = agent.graph.invoke(inputs, b_config)  # bot checkpoint FIRST
+    except GraphRecursionError:
+        # The loop would not settle. Nothing is written into the thread to
+        # explain it - the customer is told here, and the trace carries the
+        # detail. A turn that cannot finish is an error, not a conversation.
+        trace.add("error", "recursion_limit",
+                  limit=settings().graph_recursion_limit)
+        return _reply(event, RECURSION_REPLY, trace), trace
 
     # The resolver checkpoint is written by its own invocation above; the
     # ledger update below is the second write, and the stale-by-one-turn
@@ -167,6 +183,11 @@ def state_documents(agent, event: IngestEvent, spec) -> list[dict]:
     snapshot = agent.graph.get_state(
         {"configurable": {"thread_id": bot_thread(event.user_id, spec.lob)}})
     return list((snapshot.values or {}).get("documents") or [])
+
+
+RECURSION_REPLY = (
+    "I got stuck working that out and would rather stop than keep you "
+    "waiting. Shall I put you through to a colleague who can pick it up?")
 
 
 def _store_document(event: IngestEvent, lob: str, trace: Trace):
@@ -213,7 +234,7 @@ def _clear_bot_thread(agent, config) -> None:
     separate concern - but the fields a journey is made of are emptied.
     """
     agent.graph.update_state(config, {
-        "slots": {}, "quotes": {}, "pending_confirmation": None,
+        "slots": {}, "quotes": {},
         "known_facts": [],
     })
 

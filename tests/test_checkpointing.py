@@ -89,45 +89,20 @@ def test_the_per_turn_context_is_never_checkpointed(client):
 def test_per_turn_scratch_is_reset_on_the_way_in(client):
     """Retrieval results and tool names are per-turn. They live in state
     because everything in a graph does, so the entry node clears them."""
-    from app.agents.graph import MAX_TOOL_ROUNDS
-
     _say(client, CUSTOMER, "what is the waiting period for pre-existing disease")
     after_retrieval = _bot_values(BOT_05, CUSTOMER, "health")
     assert after_retrieval.get("retrieved")
-    first_rounds = after_retrieval.get("rounds", 0)
 
     # A turn that retrieves nothing must not inherit the last turn's chunks.
     _say(client, CUSTOMER, "thanks")
-    assert not _bot_values(BOT_05, CUSTOMER, "health").get("retrieved")
+    after = _bot_values(BOT_05, CUSTOMER, "health")
+    assert not after.get("retrieved")
 
-    # And the round counter counts THIS turn, not the conversation. Left
-    # accumulating, every conversation would hit the tool-round limit and
-    # hand off after a few turns.
-    for _ in range(3):
-        _say(client, CUSTOMER, "what is the initial waiting period")
-    assert _bot_values(BOT_05, CUSTOMER, "health")["rounds"] == first_rounds
-    assert first_rounds <= MAX_TOOL_ROUNDS
-
-
-# --- journey state DOES persist -------------------------------------------
-def test_a_parked_confirmation_is_checkpointed_not_parked_in_memory(client):
-    """AG-6 with no interrupts: waiting is a field that is still empty, and
-    it survives because the checkpointer wrote it - not because a process
-    stayed alive."""
-    client.post("/api/consent", json={"user_id": CUSTOMER,
-                                      "purpose": "quotation", "granted": True})
-    _say(client, CUSTOMER, "please give me a health quote")
-
-    values = _bot_values(BOT_05, CUSTOMER, "health")
-    pending = values.get("pending_confirmation")
-    assert pending and pending["tool"] == "quote_create_health"
-    assert pending["token"]
-
-    done = _say(client, CUSTOMER, "yes")
-    assert [e["label"] for e in done["trace"]["events"]
-            if e["kind"] == "tool"] == ["quote_create_health"]
-    assert not _bot_values(BOT_05, CUSTOMER, "health").get("pending_confirmation")
-
+    # `rounds` counts THIS turn, not the conversation. It is a trace label
+    # now and nothing more - the loop is bounded by recursion_limit - but a
+    # counter that accumulated across turns would still be a bug worth
+    # catching, so it is checked against the first turn rather than growing.
+    assert after.get("rounds", 0) <= after_retrieval.get("rounds", 0)
 
 def test_the_checkpointer_keeps_a_history_we_can_read_back(client):
     """State history comes free with a checkpointer, and it is what makes the
@@ -387,35 +362,3 @@ def test_reads_are_strongly_consistent():
         assert "ConsistentRead" in inspect.getsource(fn), fn.__name__
 
 
-def test_a_parked_confirmation_does_not_swallow_the_conversation():
-    """Found by replaying a real transcript against the deployed runtime.
-
-    While a confirmation was parked, every message was read ONLY as an answer
-    to it. "What is copayment?" came back as "I am about to create a health
-    quote - shall I go ahead?", and so did the question after that. The
-    customer could not change the subject until they said yes, said no, or
-    waited out the 30-minute expiry.
-
-    An unclear answer now carries on to the model, and the confirmation stays
-    parked so yes still works afterwards.
-    """
-    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
-
-    agent = agent_for(BOT_05)
-
-    # The customer asked something else entirely.
-    asked_something_else = {"messages": [HumanMessage(content="what is "
-                                                              "copayment?")]}
-    assert agent._after_pending(asked_something_else) == "model"
-
-    # They said yes, the tool ran, and the model speaks to the result.
-    confirmed = {"messages": [ToolMessage(content="{}", tool_call_id="t")]}
-    assert agent._after_pending(confirmed) == "model"
-
-    # They declined; that is already answered and the turn is over.
-    declined = {"messages": [AIMessage(content="No problem - I have not "
-                                               "done that.")]}
-    assert agent._after_pending(declined) == "end"

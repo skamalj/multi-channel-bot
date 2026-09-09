@@ -46,8 +46,6 @@ class BotState(TypedDict, total=False):
     documents: list[dict]
     slots: dict[str, Any]
     quotes: dict[str, Any]
-    # AG-6: waiting is a field that is still empty, not a parked node.
-    pending_confirmation: dict[str, Any] | None
     # Facts this journey established, so a later turn can check what the
     # model says about them. Bounded in the respond node.
     known_facts: list[str]
@@ -61,7 +59,6 @@ class BotState(TypedDict, total=False):
     tools_called: list[str]
     used_core_tool: bool
     looked_up: bool
-    parked: bool
     last_tools: list[str]
     # Set by the entry node when Bedrock Guardrails rejected the inbound
     # message. Per-turn scratch like the rest of this block.

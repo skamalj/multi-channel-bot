@@ -256,34 +256,6 @@ def test_the_confirmation_token_is_stable_across_the_round_trip():
         confirm.token_for("payment_collect", args | {"amount": 9000.0})
 
 
-def test_the_summary_names_every_argument():
-    """A confirmation that hides a field is not a confirmation of the call
-    that will run."""
-    summary = confirm.summarise("payment_collect",
-                                {"application_id": "A-1", "amount": 8000.0,
-                                 "mode": "upi", "_idempotency_key": "x"})
-    assert "8000" in summary and "upi" in summary and "A-1" in summary
-    assert "_idempotency_key" not in summary
-
-
-def test_an_unclear_answer_is_not_a_yes():
-    assert confirm.read_answer("yes please") == "yes"
-    assert confirm.read_answer("no thanks") == "no"
-    assert confirm.read_answer("what does that cost?") == "unclear"
-    assert confirm.read_answer("") == "unclear"
-
-
-def test_a_parked_confirmation_expires():
-    import time
-
-    state: dict = {}
-    confirm.park(state, "policy_issue", {"application_id": "A-1"})
-    assert confirm.pending_of(state)
-    state["pending_confirmation"]["ts"] = time.time() - confirm.TTL_S - 1
-    assert confirm.pending_of(state) is None
-    assert "pending_confirmation" not in state
-
-
 # ---------------------------------------------------------------------------
 # the verifier's own number-to-sentence mapping - code, so tested as code
 # ---------------------------------------------------------------------------
@@ -408,54 +380,6 @@ def test_the_internal_checks_do_not_carry_the_customer_guardrail(monkeypatch):
 # ---------------------------------------------------------------------------
 # consent - the highest-stakes decision in the system
 # ---------------------------------------------------------------------------
-def test_a_qualified_yes_is_not_consent(monkeypatch):
-    """These all read as YES when two regexes decided consent, anchored on the
-    first word of the reply. The actions behind that gate are policy_issue,
-    payment_collect and claim_register - so "ok but not the payment" took the
-    payment, and "yes, but change the sum insured first" issued at the old
-    figure. Nothing that carries a condition, a change or a question is
-    consent to what was actually proposed."""
-    from app.llm import bedrock
-
-    class _Msg:
-        def __init__(self, t): self.content = t
-
-    class _LLM:
-        def __init__(self, verdict): self.verdict = verdict
-        def invoke(self, _m): return _Msg(self.verdict)
-
-    for reply, verdict in [
-        ("ok but not the payment", "UNCLEAR"),
-        ("yes, but change the sum insured to 5 lakh first", "UNCLEAR"),
-        ("sure, wait - actually no", "UNCLEAR"),
-        ("ok what does it cost?", "UNCLEAR"),
-        ("confirm the ages first please", "UNCLEAR"),
-        ("go on then", "YES"),
-        ("that works for me", "YES"),
-    ]:
-        monkeypatch.setattr(bedrock, "settings", lambda: type(
-            "C", (), {"mock_llm": False, "no_aws": False})())
-        monkeypatch.setattr(bedrock, "get_llm",
-                            lambda *a, **k: _LLM(verdict))
-        got = confirm.read_answer(reply)
-        want = verdict.lower()
-        assert got == want, f"{reply!r} read as {got}, expected {want}"
-
-
-def test_an_unreadable_confirmation_asks_again_rather_than_proceeding(monkeypatch):
-    """Fails CLOSED, unlike every other model call in the build. A payment
-    must not go through because an endpoint was slow."""
-    from app.llm import bedrock
-
-    def _boom(*a, **k):
-        raise RuntimeError("throttled")
-
-    monkeypatch.setattr(bedrock, "settings", lambda: type(
-        "C", (), {"mock_llm": False, "no_aws": False})())
-    monkeypatch.setattr(bedrock, "get_llm", _boom)
-    assert confirm.read_answer("yes go ahead") == "unclear"
-
-
 def test_the_guardrail_screens_the_customer_not_our_own_prompt(monkeypatch):
     """Bedrock screens the whole request unless told otherwise, so the system
     prompt and the retrieved passages were judged as if the customer had
@@ -560,3 +484,51 @@ def test_consent_is_confirmed_before_it_is_recorded():
     from app.mcpserver.registry import get_tool
 
     assert get_tool("consent_grant").effect == "write"
+
+
+def test_the_idempotency_token_is_stable_across_the_round_trip():
+    """All that survives of the confirmation machinery, and the one part a
+    prompt cannot do: the same call agreed to twice writes once.
+
+    Keying on the message id would give the agreeing turn a different key,
+    which is exactly the retry that must not double-charge.
+    """
+    args = {"application_id": "A-1", "amount": 8000.0, "mode": "upi"}
+    assert confirm.token_for("payment_collect", args) == \
+        confirm.token_for("payment_collect", dict(reversed(list(args.items()))))
+    assert confirm.token_for("payment_collect", args) != \
+        confirm.token_for("payment_collect", args | {"amount": 9000.0})
+
+
+def test_a_tool_documents_its_parameters_not_the_workflow():
+    """A description says what the tool IS and what each parameter means.
+    What to do before calling it is workflow, and workflow is in the prompt -
+    one place that describes the journey, rather than a rule repeated across
+    twelve tool descriptions and impossible to read as a whole.
+    """
+    from app.agents.graph import _tool_schemas
+    from app.agents.registry import BOT_05
+
+    by_name = {t["name"]: t for t in _tool_schemas(BOT_05)}
+    quote = by_name["quote_create_health"]
+
+    props = quote["input_schema"]["properties"]
+    assert "rupees" in props["sum_insured"]["description"].lower()
+    assert props["sum_insured"]["description"].endswith("Required.")
+    assert props["addons"]["description"].endswith("Optional.")
+    assert "sum_insured" in quote["input_schema"]["required"]
+    assert "addons" not in quote["input_schema"]["required"]
+
+    # And no workflow smuggled into the description.
+    assert "wait for them to agree" not in quote["description"].lower()
+
+
+def test_the_prompt_names_the_tools_that_change_something():
+    """The model has to know which calls need asking about. That list is
+    workflow, so it lives in the prompt with the rest of the journey."""
+    from app.agents.prompts import load
+
+    text = load("health_customer.md")
+    for name in ("quote_create_health", "payment_collect", "policy_issue",
+                 "consent_grant"):
+        assert name in text, f"the prompt never names {name}"
