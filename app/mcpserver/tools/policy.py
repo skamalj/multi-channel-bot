@@ -127,3 +127,53 @@ def endorsement_apply(policy_id: str, endorsement_type: str, value: str,
         return store.endorsement_apply(policy_id, endorsement_type, value)
     except CoreError as exc:
         return exc.as_result()
+
+
+# The purposes a customer can be asked to consent to, and what each one is
+# for in plain words. A closed set: consent to "everything" is not consent,
+# and a purpose the model can invent is a purpose nobody agreed to.
+CONSENT_PURPOSES = {
+    "quotation": "prepare a quote using the details you have given",
+    "kyc": "submit your KYC documents to the insurer",
+    "payment": "collect a premium payment from you",
+}
+
+
+@tool(tags={"lob": "health|motor", "persona": "customer|agent"},
+      effect="write", authority="none", auth="none", idempotent=True,
+      choices={"purpose": sorted(CONSENT_PURPOSES)})
+def consent_grant(purpose: str, _user_id: str | None = None) -> dict:
+    """Record that the customer agreed to something being done for them.
+
+    Call this when a tool has been refused for want of consent. The customer
+    is asked first - this is a write, so the confirmation gate puts the
+    purpose to them in their own words and nothing is recorded until they
+    say yes. Their yes IS the consent, and it is what gets written down.
+
+    Without this the gate was a dead end. Every quote tool needs consent for
+    'quotation', no seeded customer had it, and nothing in the conversation
+    could grant it - so a customer who asked for a quote was told there was a
+    "system authorization issue" and there was no way forward from inside the
+    chat. A consent gate that cannot be satisfied by consenting is not a
+    control, it is a wall.
+    """
+    from app.memory.longterm import consent as ledger
+
+    if purpose not in CONSENT_PURPOSES:
+        return {"error": "unknown_purpose", "purpose": purpose,
+                "detail": "consent is recorded per purpose, from a fixed set",
+                "allowed": sorted(CONSENT_PURPOSES)}
+    if not _user_id:
+        return {"error": "no_subject",
+                "detail": "there is nobody to record consent for"}
+
+    # `user_stated` is the truth here and the reason this runs behind the
+    # confirmation gate: the customer was shown the purpose and said yes.
+    # The ledger refuses evidence sourced from a model inference, which is
+    # exactly what recording consent nobody gave would be.
+    ledger.record(_user_id, purpose, True,
+                  {"source": "user_stated", "ref": "confirmed in conversation"})
+    return {"status": "recorded", "purpose": purpose,
+            "means": CONSENT_PURPOSES[purpose],
+            "note": ("consent is recorded for this purpose and the call that "
+                     "needed it can now be made")}

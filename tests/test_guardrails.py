@@ -487,3 +487,76 @@ def test_the_guardrail_screens_the_customer_not_our_own_prompt(monkeypatch):
     # No guardrail, no flag - langchain-aws rejects the combination.
     bedrock.get_llm(guardrail=False)
     assert "guard_last_turn_only" not in seen[-1]
+
+
+# ---------------------------------------------------------------------------
+# consent the customer can actually give
+# ---------------------------------------------------------------------------
+def test_a_consent_denial_tells_the_model_to_ask_rather_than_apologise():
+    """Reported: "I'm unable to generate a quote at this moment due to a
+    system authorization issue."
+
+    Every quote tool needs consent for 'quotation', no seeded customer had
+    it, and nothing in the conversation could grant it - so the customer met
+    a wall described as a fault. Needing permission is not the same as not
+    being allowed.
+    """
+    from app.agents.graph import agent_for
+    from app.agents.registry import BOT_05
+    from app.obs.trace import Trace
+
+    agent = agent_for(BOT_05)
+    out = agent._run_tool(
+        "quote_create_health",
+        {"product_id": "PHS", "sum_insured": 500000,
+         "member_ages": [40], "city": "Pune"},
+        {"persona": "customer", "lob": "health", "authenticated": True,
+         "customer_id": "C-10001", "user_id": "u-consent",
+         "consent": {}, "confirmed": True},
+        Trace())
+
+    assert out["error"] == "consent_required", out
+    assert out["purpose"] == "quotation"
+    assert "consent_grant" in out["try_instead"]
+    assert "system fault" in out["remedy"]
+
+
+def test_consent_is_recorded_only_for_a_purpose_that_exists():
+    from app.mcpserver.tools.policy import consent_grant
+
+    bad = consent_grant("everything", _user_id="u-consent")
+    assert bad["error"] == "unknown_purpose", bad
+    assert "quotation" in bad["allowed"]
+
+    nobody = consent_grant("quotation", _user_id=None)
+    assert nobody["error"] == "no_subject"
+
+
+def test_granting_consent_unblocks_the_call_that_needed_it():
+    """End to end through the ledger: the gate refuses, consent is given,
+    the gate passes."""
+    from app.memory.longterm import consent as ledger
+    from app.mcpserver.registry import authorize, get_tool
+    from app.mcpserver.tools.policy import consent_grant
+
+    spec = get_tool("quote_create_health")
+    ctx = {"persona": "customer", "lob": "health", "authenticated": True,
+           "customer_id": "C-1", "user_id": "u-consent-flow", "consent": {}}
+    ok, why = authorize(spec, ctx, {})
+    assert not ok and "consent" in why
+
+    consent_grant("quotation", _user_id="u-consent-flow")
+    ctx["consent"] = ledger.current("u-consent-flow")
+    assert ctx["consent"].get("quotation") is True
+
+    ok, why = authorize(spec, ctx, {})
+    assert ok, why
+
+
+def test_consent_is_confirmed_before_it_is_recorded():
+    """AG-6 applies to consent more than to anything else: it is a write, so
+    the customer is shown the purpose and nothing is written until they say
+    yes. Their yes IS the consent."""
+    from app.mcpserver.registry import get_tool
+
+    assert get_tool("consent_grant").effect == "write"

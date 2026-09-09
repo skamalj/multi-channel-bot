@@ -546,6 +546,24 @@ class Agent:
             # A denial that only says "no" leaves the model with one move:
             # apologise. Telling it what it MAY call turns a refusal into a
             # redirect.
+            #
+            # Consent is the one denial the customer can lift themselves, and
+            # saying "do not retry" to it produced "I'm unable to generate a
+            # quote at this moment due to a system authorization issue" - a
+            # dead end dressed up as a fault, when the customer had only to
+            # be asked. Needing permission is not the same as not being
+            # allowed, and the two now read differently.
+            if spec.consent_purpose and "consent" in why:
+                return {"error": "consent_required",
+                        "detail": why,
+                        "purpose": spec.consent_purpose,
+                        "remedy": ("the customer has not agreed to this yet. "
+                                   "Ask them, call consent_grant with this "
+                                   "purpose, and then make this call again. "
+                                   "Do not describe this as a system fault - "
+                                   "it is a permission they can give."),
+                        "try_instead": ["consent_grant"]}
+
             return {"error": "not_authorized", "detail": why,
                     "remedy": ("this call is not permitted for the current "
                                "caller; do not retry it with different "

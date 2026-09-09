@@ -40,6 +40,7 @@ _LABELS = {
     "claim_register": "register a claim",
     "cashless_preauth": "raise a cashless pre-authorisation",
     "endorsement_apply": "change the policy",
+    "consent_grant": "record your consent",
 }
 
 
