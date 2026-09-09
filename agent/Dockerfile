@@ -24,6 +24,10 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
 COPY scripts ./scripts
+# The instructions the bots run on. They are files, not strings in Python, so
+# they have to be IN the image - without this the container builds cleanly
+# and then fails to start, because a configuration cannot load its prompt.
+COPY prompts ./prompts
 COPY data/products.yaml ./data/products.yaml
 COPY agent/server.py ./server.py
 
@@ -32,6 +36,10 @@ COPY agent/server.py ./server.py
 # disagrees with the catalogue it was built from. It is the fallback when no
 # Knowledge Base is configured; with one, retrieval goes to Bedrock.
 RUN NO_AWS=1 MOCK_LLM=1 uv run --no-dev python scripts/build_corpus.py
+
+# Fail the BUILD, not the first request, if a configuration cannot find its
+# instructions. Every bot is constructed here, which loads every prompt file.
+RUN NO_AWS=1 MOCK_LLM=1 uv run --no-dev python -c "from app.agents.registry import REGISTRY; assert all(s.system_prompt.strip() for s in REGISTRY.values()); print('prompts loaded for', sorted(s.bot_id for s in REGISTRY.values()))"
 
 # ---------------------------------------------------------------- runtime
 FROM --platform=linux/arm64 python:3.12-slim
