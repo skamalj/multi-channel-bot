@@ -344,15 +344,56 @@ class Agent:
         retrieved = list(state.get("retrieved") or [])
         tools_called = list(state.get("tools_called") or [])
 
-        if state.get("rounds", 0) >= MAX_TOOL_ROUNDS and \
-                (getattr(ai, "tool_calls", None) or []):
+        pending_calls = getattr(ai, "tool_calls", None) or []
+        if state.get("rounds", 0) >= MAX_TOOL_ROUNDS and pending_calls:
             trace.add("error", "tool_round_limit", rounds=MAX_TOOL_ROUNDS)
-            self._run_tool("human_handoff",
-                           {"reason": "tool round limit",
-                            "summary": (_last_human_text(state) or "")[:200]},
-                           ctx, trace)
-            return {"messages": [_system_msg(HANDOFF)],
-                    "last_tools": tools_called, "last_citations": []}
+            args = {"reason": f"tool round limit ({MAX_TOOL_ROUNDS} rounds)",
+                    "summary": (_last_human_text(state) or "")[:200]}
+            result = self._run_tool("human_handoff", args, ctx, trace)
+
+            # Everything below is about what the NEXT turn can see, and it
+            # used to see two wrong things.
+            #
+            # First, the tool calls this turn ran out of budget for were
+            # never answered. `_after_model` routes here instead of to the
+            # tools node, so an AI message carrying tool_calls was left in
+            # the thread with no ToolMessage against it - the orphaned pair
+            # Bedrock rejects outright on the next turn. Every one of them is
+            # answered now, truthfully: it did not run, and why.
+            #
+            # Second, the handoff itself left no trace the model could read.
+            # The customer-facing message is system_authored, so the model
+            # never saw it, and on the next turn it invented a reason for the
+            # conversation having stopped - "I have already searched the
+            # approved sources and no product information was found", which
+            # was not true and which then poisoned every turn after it.
+            # Recording the call and its result means the model knows a
+            # colleague is already involved and can say so, instead of
+            # guessing. A handoff should not interrupt the conversation.
+            handoff_id = "handoff-round-limit"
+            messages: list[Any] = [
+                ToolMessage(
+                    tool_call_id=call.get("id") or call.get("name", "tool"),
+                    content=json.dumps({
+                        "error": "tool_round_limit",
+                        "detail": (f"this turn reached its limit of "
+                                   f"{MAX_TOOL_ROUNDS} tool rounds, so this "
+                                   f"call was not made"),
+                    }))
+                for call in pending_calls
+            ]
+            messages += [
+                AIMessage(content="", tool_calls=[{
+                    "name": "human_handoff", "args": args, "id": handoff_id}]),
+                ToolMessage(tool_call_id=handoff_id,
+                            content=json.dumps(result, default=str)[:8000]),
+                _system_msg(HANDOFF),
+            ]
+            return {"messages": messages,
+                    "tools_called": ["human_handoff"],
+                    "tool_facts": [json.dumps(result, default=str)],
+                    "last_tools": tools_called + ["human_handoff"],
+                    "last_citations": []}
 
         # Facts this journey established count as established.
         known = " ".join(list(state.get("known_facts") or [])

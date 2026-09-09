@@ -328,3 +328,56 @@ def test_with_no_guardrail_deployed_nothing_is_filtered_on_text(monkeypatch):
         "C", (), {"guardrail_blocked_message": ""})())
     msgs = [AIMessage(content="", id="a1"), AIMessage(content="hello", id="a2")]
     assert G.model_visible(msgs) == msgs
+
+
+def test_the_round_limit_leaves_no_orphaned_tool_call(monkeypatch):
+    """The round limit routes to respond, not to the tools node - so the tool
+    calls it ran out of budget for were never answered, and an AI message
+    carrying tool_calls sat in the thread with no ToolMessage against it.
+    That is the pair Bedrock rejects outright on the next turn:
+
+        Expected toolResult blocks at messages.0.content
+
+    It also left nothing the model could read about the handoff, so the next
+    turn invented a reason the conversation had stopped - "I have already
+    searched the approved sources and no product information was found" -
+    which was false and poisoned every turn after it.
+    """
+    from app.agents import graph as G
+
+    agent = agent_for(BOT_05)
+    monkeypatch.setattr(agent, "_run_tool",
+                        lambda *a, **k: {"status": "queued", "sla_minutes": 15})
+
+    unanswered = AIMessage(content="", id="a9", tool_calls=[
+        {"name": "kb_search_health", "args": {"query": "x"}, "id": "tc9"},
+        {"name": "kb_search_health", "args": {"query": "y"}, "id": "tc10"}])
+    state = {"messages": [HumanMessage(content="compare the three", id="h1"),
+                          unanswered],
+             "rounds": G.MAX_TOOL_ROUNDS, "tools_called": ["kb_search_health"]}
+
+    out = agent._respond(state, {"configurable": {"trace": Trace()}})
+    produced = out["messages"]
+
+    # Every call the model made is answered, so nothing is orphaned.
+    answered = {m.tool_call_id for m in produced if isinstance(m, ToolMessage)}
+    assert {"tc9", "tc10"} <= answered, f"unanswered tool calls: {answered}"
+
+    # And the handoff is in the thread as a call the model can read, not only
+    # as a sentence the customer sees.
+    handoff = [m for m in produced if isinstance(m, AIMessage)
+               and any(c["name"] == "human_handoff"
+                       for c in (m.tool_calls or []))]
+    assert handoff, "the handoff left no record the model can read"
+    assert "human_handoff" in out["tools_called"]
+
+    # The whole batch, replayed, keeps every call paired with its result.
+    full = state["messages"] + produced
+    call_ids = {c["id"] for m in full if isinstance(m, AIMessage)
+                for c in (m.tool_calls or [])}
+    orphans = [m.tool_call_id for m in full if isinstance(m, ToolMessage)
+               and m.tool_call_id not in call_ids]
+    assert orphans == [], f"tool results with no call: {orphans}"
+    unanswered_ids = call_ids - {m.tool_call_id for m in full
+                                if isinstance(m, ToolMessage)}
+    assert unanswered_ids == set(), f"calls with no result: {unanswered_ids}"
