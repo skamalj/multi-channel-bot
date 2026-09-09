@@ -274,14 +274,44 @@ agent into a line of business.
 
 Allowed values: {options}, or "unknown".
 
+Our products, which a customer will name without saying which line they are:
+{products}
+
 Rules:
-- Answer "unknown" unless the message itself gives you evidence. A greeting, \
-a thank-you or a general question is "unknown".
+- Naming one of our products IS evidence. "What is the waiting period on \
+Health Secure" is health, because Health Secure is a health product.
+- Otherwise answer "unknown" unless the message itself gives you evidence. A \
+greeting, a thank-you or a general question is "unknown".
 - Do not guess from what is statistically common.
 - confidence is your probability that the label is right, 0.0 to 1.0.
 
 Reply with JSON only: {{"lob": "...", "confidence": 0.0, "evidence": "the \
 words that decided it"}}"""
+
+
+def _product_vocabulary(options: list[str]) -> str:
+    """Our product names, per line of business, for the classifier.
+
+    Not a keyword list deciding anything - the model still decides. This is
+    the vocabulary it cannot be expected to have: "Health Secure" means
+    nothing to a general model, and it read "the waiting period on Health
+    Secure" as a question that "does not specify a line of business". So
+    every conversation that named a product by name was asked which line of
+    business it was about, over and over, and never got past the question.
+
+    Read from the catalogue, so a product added there is a product the router
+    recognises without anyone remembering to update a list.
+    """
+    from app.coremock.catalog import catalog
+
+    book = catalog()
+    lines = []
+    for lob in options:
+        names = [f"{p.get('name')} ({p.get('product_id')})"
+                 for p in book.get(lob, []) if p.get("name")]
+        if names:
+            lines.append(f"- {lob}: " + ", ".join(names))
+    return "\n".join(lines) or "- (no catalogue available)"
 
 
 def classify_lob(text: str, options: list[str]) -> tuple[str | None, float, str]:
@@ -301,7 +331,8 @@ def classify_lob(text: str, options: list[str]) -> tuple[str | None, float, str]
         llm = get_llm(small=True, guardrail=False)
         resp = llm.invoke([
             SystemMessage(content=_INTENT_PROMPT.format(
-                options=", ".join(f'"{o}"' for o in options))),
+                options=", ".join(f'"{o}"' for o in options),
+                products=_product_vocabulary(options))),
             HumanMessage(content=text[:1000]),
         ])
         content = resp.content
