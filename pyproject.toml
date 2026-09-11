@@ -19,6 +19,7 @@ dependencies = [
     "mcp>=1.2",
     "httpx>=0.27",
     "agentstate-reducer>=0.3.0",
+    "langchain>=1.4.0",
 ]
 
 [project.optional-dependencies]

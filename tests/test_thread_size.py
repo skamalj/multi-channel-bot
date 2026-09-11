@@ -151,80 +151,11 @@ def test_erasure_reaches_the_documents(client):
     assert documents().get(ref) is None
 
 
-def test_what_reaches_the_model_keeps_every_tool_call_with_its_result():
-    """The reducer got this right and a second window downstream undid it.
-
-    `_model` used to slice `history[-msg_history_to_keep:]` on top of the
-    reduction. That cut at 12 while the reducer prunes at 24, so between the
-    two numbers the slice was the only thing trimming - and it trimmed
-    blindly, straight through an AI tool_calls message and the ToolMessage
-    answering it. Bedrock rejects that outright:
-
-        Expected toolResult blocks at messages.0.content for the following
-        Ids: functions.kb_search_health:0
-
-    The reducer owns the window now. This test watches the messages actually
-    handed to the model, because that is where the damage was done.
-    """
-    agent = agent_for(BOT_05)
-    seen: dict = {}
-
-    class _Capture:
-        def invoke(self, messages):
-            seen["messages"] = messages
-            return AIMessage(content="ok", id="final")
-
-    original, agent.llm = agent.llm, _Capture()
-    try:
-        agent._model({"messages": _turns(5), "rounds": 0},
-                     {"configurable": {"trace": Trace()}})
-    finally:
-        agent.llm = original
-
-    sent = seen["messages"]
-    call_ids = {tc["id"] for m in sent
-                if isinstance(m, AIMessage) for tc in (m.tool_calls or [])}
-    orphans = [m.tool_call_id for m in sent
-               if isinstance(m, ToolMessage) and m.tool_call_id not in call_ids]
-    assert orphans == [], f"tool results with no call: {orphans}"
-
-    # And the whole conversation arrived - nothing was quietly dropped on the
-    # way to the model.
-    assert len([m for m in sent if isinstance(m, ToolMessage)]) == 5
-
-
-def test_a_thread_that_does_not_divide_evenly_still_reaches_the_model_whole():
-    """The shape that actually broke in production.
-
-    A fixed-size window only orphans a tool result when the cut lands
-    mid-turn, which depends on how many messages happen to precede it - so
-    the bug hid behind conversations that divided evenly and appeared on the
-    ones that did not. Twenty-two messages puts the cut squarely on a
-    ToolMessage whose AI tool_calls message falls outside it.
-    """
-    agent = agent_for(BOT_05)
-    history = _turns(5) + [HumanMessage(content="and my wife?", id="hx"),
-                           AIMessage(content="how old is she?", id="rx")]
-    assert len(history) == 22
-    seen: dict = {}
-
-    class _Capture:
-        def invoke(self, messages):
-            seen["messages"] = messages
-            return AIMessage(content="ok", id="final")
-
-    original, agent.llm = agent.llm, _Capture()
-    try:
-        agent._model({"messages": history, "rounds": 0},
-                     {"configurable": {"trace": Trace()}})
-    finally:
-        agent.llm = original
-
-    sent = seen["messages"]
-    call_ids = {tc["id"] for m in sent
-                if isinstance(m, AIMessage) for tc in (m.tool_calls or [])}
-    orphans = [m.tool_call_id for m in sent
-               if isinstance(m, ToolMessage) and m.tool_call_id not in call_ids]
-    assert orphans == [], f"tool results with no call: {orphans}"
+# The two tests that used to live here drove `Agent._model` directly, to prove
+# a second call-time window did not re-trim through a tool pair after the
+# reducer had kept it whole. That window is gone: there is no `_model` node,
+# the reducer (before_model) is the ONLY thing that trims, and
+# `test_pruning_never_orphans_a_tool_result` above is the invariant. Nothing
+# assembles a second message list to check.
 
 

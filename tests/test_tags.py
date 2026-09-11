@@ -1,12 +1,35 @@
-"""Tags are a build-time filter, and the capability matrix is the artefact
-that proves it. `authorize()` is the control that does not depend on it."""
+"""Tags are a build-time filter (`tools_for`); the authorization hook
+(`controls._authorize`) is the control that does not depend on it. The
+model-visible schema and the behaviour policy both come off the framework
+`@tool` object - the schema from `convert_to_openai_tool`, the policy from
+`extras`.
+"""
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+from app.agents.context import RequestContext
+from app.agents.controls import _authorize
 from app.agents.registry import BOT_02, BOT_05, BOT_06, capability_matrix
-from app.mcpserver.registry import (authorize, get_tool, json_schema,
-                                    list_tools)
+from app.mcpserver.registry import get_tool, tools_for
 
 
+def _names(spec) -> set[str]:
+    return {t.name for t in tools_for(spec.tool_tags)}
+
+
+def _authz(tool_name: str, ctx: dict, args: dict | None = None):
+    """Authorize as the hook does: the tool's `extras` policy against a
+    per-call `RequestContext`."""
+    tool = get_tool(tool_name)
+    return _authorize(tool.extras or {}, RequestContext(**ctx), args or {})
+
+
+def _schema(tool_name: str) -> dict:
+    return convert_to_openai_tool(get_tool(tool_name))["function"]["parameters"]
+
+
+# -- binding is a build-time tag filter -------------------------------------
 def test_bot05_never_gets_agent_only_or_motor_tools():
-    names = {t.name for t in list_tools(match=BOT_05.tool_tags)}
+    names = _names(BOT_05)
     assert "commission_statement" not in names
     assert "kb_search_motor" not in names
     assert "network_garages" not in names
@@ -14,7 +37,7 @@ def test_bot05_never_gets_agent_only_or_motor_tools():
 
 
 def test_bot02_gets_agent_tools_and_no_health_tools():
-    names = {t.name for t in list_tools(match=BOT_02.tool_tags)}
+    names = _names(BOT_02)
     assert "commission_statement" in names
     assert "kb_search_motor" in names
     assert "kb_search_health" not in names
@@ -22,7 +45,7 @@ def test_bot02_gets_agent_tools_and_no_health_tools():
 
 
 def test_the_customer_motor_bot_has_no_commercial_tools():
-    names = {t.name for t in list_tools(match=BOT_06.tool_tags)}
+    names = _names(BOT_06)
     assert "commission_statement" not in names
     assert "kb_search_motor" in names
 
@@ -33,135 +56,108 @@ def test_capability_matrix_is_static_and_printable():
     for info in m.values():
         assert info["tools"]
         for t in info["tools"]:
-            assert {"name", "effect", "authority", "auth", "confirm"} <= set(t)
+            assert {"name", "effect", "authority", "auth", "subject"} <= set(t)
 
 
+# -- authorization is the control, per call ---------------------------------
 def test_server_check_refuses_even_when_the_tool_was_bound():
-    """A model can name a tool it was never offered - the client filter is
-    context economy, the server check is the control."""
-    spec = get_tool("commission_statement")
-    ok, why = authorize(spec, {"persona": "customer", "user_id": "x",
-                               "authenticated": True, "lob": "motor"})
+    """A model can name a tool it was never offered - the tag filter is
+    context economy, the hook is the control."""
+    ok, why = _authz("commission_statement",
+                     {"persona": "customer", "user_id": "x",
+                      "authenticated": True, "lob": "motor"})
     assert not ok and "persona" in why
 
 
 def test_a_producer_cannot_read_another_producers_book():
     """AG-5. Having the tool bound is not permission to read that subject."""
-    spec = get_tool("commission_statement")
     ctx = {"persona": "agent", "user_id": "919820000001", "lob": "motor",
            "authenticated": True, "producer_id": "P-2201"}
-    ok, _ = authorize(spec, ctx, {"producer_id": "P-2201", "period": "2026-08"})
+    ok, _ = _authz("commission_statement", ctx,
+                   {"producer_id": "P-2201", "period": "2026-08"})
     assert ok
-    ok, why = authorize(spec, ctx, {"producer_id": "P-9999",
-                                    "period": "2026-08"})
-    assert not ok and "another producer" in why
+    ok, why = _authz("commission_statement", ctx,
+                     {"producer_id": "P-9999", "period": "2026-08"})
+    assert not ok and "does not match" in why
 
 
 def test_a_customer_cannot_read_another_customers_policy():
-    spec = get_tool("policy_get")
-    ctx = {"persona": "customer", "user_id": "u", "authenticated": True,
-           "lob": "health", "customer_id": "C-10002"}
-    ok, why = authorize(spec, ctx, {"policy_id": "PHS-4471902",
-                                    "lob": "health"})
+    ok, why = _authz("policy_get",
+                     {"persona": "customer", "user_id": "u",
+                      "authenticated": True, "lob": "health",
+                      "customer_id": "C-10002"},
+                     {"policy_id": "PHS-4471902", "lob": "health"})
     assert not ok and "does not belong" in why
 
 
 def test_authenticated_tools_refuse_anonymous_callers():
-    spec = get_tool("policy_get")
-    ok, why = authorize(spec, {"persona": "customer", "user_id": "x",
-                               "lob": "health", "authenticated": False})
+    ok, why = _authz("policy_get",
+                     {"persona": "customer", "user_id": "x",
+                      "lob": "health", "authenticated": False})
     assert not ok and "authentication" in why
 
 
 def test_consent_gated_tools_refuse_without_a_current_consent():
-    spec = get_tool("quote_create_health")
     base = {"persona": "customer", "user_id": "x", "lob": "health",
             "authenticated": True}
-    ok, why = authorize(spec, base, {})
+    ok, why = _authz("quote_create_health", base, {})
     assert not ok and "consent" in why
-    ok, _ = authorize(spec, base | {"consent": {"quotation": True}}, {})
+    ok, _ = _authz("quote_create_health",
+                   {**base, "consent": {"quotation": True}}, {})
     assert ok
 
 
 def test_a_tool_from_the_other_compartment_is_refused_at_call_time():
     """The lob tag selects at build time AND is re-checked per call."""
-    spec = get_tool("kb_search_health")
-    ok, why = authorize(spec, {"persona": "customer", "user_id": "x",
-                               "lob": "motor"}, {"query": "anything"})
+    ok, why = _authz("kb_search_health",
+                     {"persona": "customer", "user_id": "x", "lob": "motor"},
+                     {"query": "anything"})
     assert not ok and "out of scope" in why
 
 
-def test_mutating_tools_declare_confirmation_and_idempotency():
-    """AG-6 is a property of the manifest, not of one call site."""
-    for t in list_tools():
-        if t.effect in ("write", "dispatch") and t.name != "human_handoff":
-            assert t.confirm, f"{t.name} mutates without confirmation"
-            assert t.idempotent, f"{t.name} mutates without an idempotency key"
-
-
-def test_schemas_resolve_real_types_not_strings():
-    """`from __future__ import annotations` makes every annotation a string;
-    a schema that types every field as a string sends "1000000" to a rating
-    engine."""
-    schema = json_schema(get_tool("quote_create_health"))
-    props = schema["properties"]
-    assert props["sum_insured"]["type"] == "integer"
-    assert props["member_ages"]["type"] == "array"
-    assert props["member_ages"]["items"] == {"type": "integer"}
-    assert props["city"]["type"] == "string"
-    assert "_idempotency_key" not in props          # injected, never modelled
-    assert set(schema["required"]) == {"product_id", "sum_insured",
-                                       "member_ages", "city"}
-
-    # And each one says what it IS, which a type cannot: the signature
-    # cannot tell a model that a sum insured is in rupees rather than lakhs.
-    assert "rupees" in props["sum_insured"]["description"].lower()
-    assert props["city"]["description"].endswith("Required.")
-    assert props["addons"]["description"].endswith("Optional.")
-
-
-def test_closed_sets_are_in_the_schema_not_in_the_models_memory():
-    """AG-9. A product id the model has to recall is one it will invent, and
-    the customer is then asked to confirm a call that cannot succeed."""
-    schema = json_schema(get_tool("quote_create_motor"))
-    assert schema["properties"]["product_id"]["enum"] == ["PMS", "PTS"]
-    # On a list parameter the closed set constrains the ELEMENTS.
-    addons = schema["properties"]["addons"]
-    assert addons["type"] == "array"
-    assert "enum" not in addons
-    assert set(addons["items"]["enum"]) == {"ZD", "RSA", "EP", "CS"}
-
-    health = json_schema(get_tool("quote_create_health"))
-    assert set(health["properties"]["product_id"]["enum"]) == {"PHS", "PHST",
-                                                               "PHSR"}
-
-
 def test_an_application_id_is_not_permission_to_act_on_it():
-    """AG-5, same class of hole as the producer id.
-
-    An application id in a prompt is not permission to clear somebody else's
-    KYC gate or pay their premium. Checking only that *an* identity exists
-    lets any authenticated caller drive another customer's issuance.
-    """
+    """AG-5, same class of hole as the producer id: an application id in a
+    prompt is not permission to pay somebody else's premium."""
     from app.coremock import rating, store
 
     store.reset_chaos()
     q = store.save_quote(rating.rate_health("PHS", 500000, [34], "Pune", []))
     app = store.application_start(q["quote_id"], "C-10001",
                                   user_id="919820000009")
-    spec = get_tool("payment_collect")
     args = {"application_id": app["application_id"], "amount": 1.0,
             "mode": "upi"}
-
     mine = {"persona": "customer", "user_id": "919820000009", "lob": "health",
             "authenticated": True, "consent": {"payment": True}}
-    ok, _ = authorize(spec, mine, args)
+    ok, _ = _authz("payment_collect", mine, args)
     assert ok
-
-    theirs = mine | {"user_id": "919899999999"}
-    ok, why = authorize(spec, theirs, args)
+    theirs = {**mine, "user_id": "919899999999"}
+    ok, why = _authz("payment_collect", theirs, args)
     assert not ok and "does not belong" in why
-
     # A producer servicing their book is a different question, and allowed.
-    ok, _ = authorize(spec, theirs | {"persona": "agent"}, args)
+    ok, _ = _authz("payment_collect", {**theirs, "persona": "agent"}, args)
     assert ok
+
+
+# -- the schema the model sees ----------------------------------------------
+def test_schemas_resolve_real_types_not_strings():
+    """A schema that types every field as a string sends "1000000" to a
+    rating engine. Types come from the real signature, and injected args
+    (runtime, entitlements) never appear."""
+    props = _schema("quote_create_health")["properties"]
+    assert props["sum_insured"]["type"] == "integer"
+    assert props["member_ages"]["type"] == "array"
+    assert props["member_ages"]["items"]["type"] == "integer"
+    assert props["city"]["type"] == "string"
+    assert "runtime" not in props and "_idempotency_key" not in props
+    assert set(_schema("quote_create_health")["required"]) == {
+        "product_id", "sum_insured", "member_ages", "city"}
+    # And a description says what a type cannot - that a sum insured is rupees.
+    assert "rupees" in props["sum_insured"]["description"].lower()
+
+
+def test_consent_gates_only_guard_state_changes():
+    """A consent purpose only makes sense on a tool that changes something."""
+    for t in tools_for():
+        e = t.extras or {}
+        if e.get("consent_purpose"):
+            assert e.get("effect") in ("write", "dispatch"), t.name

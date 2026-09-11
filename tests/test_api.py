@@ -57,7 +57,7 @@ def test_the_tool_manifest_publishes_behaviour_metadata(client):
     assert tools["policy_get"]["auth"] == "authenticated"
     assert tools["policy_get"]["pii"] is True
     assert tools["commission_statement"]["subject"] == "producer_id"
-    assert tools["payment_collect"]["confirm"] is True
+    assert tools["payment_collect"]["consent_purpose"] == "payment"
     assert tools["kb_search_health"]["effect"] == "read"
 
 
@@ -196,23 +196,22 @@ def test_a_write_tool_is_refused_without_consent(client):
     """AG-5: the server check runs whatever the client bound, and a consent
     refusal is a refusal the CUSTOMER can lift.
 
-    This used to assert on a `confirmation_required` gate - the parking
-    mechanism that intercepted the call and wrote the question into the
-    conversation itself. Asking is the model's job now, so what is left to
-    check here is the part that is not the model's job: a write with no
-    consent behind it does not run.
+    Asking is the model's job now (prompt), so what is left to check here is
+    the part that is not the model's job: the authorization hook refuses a
+    write with no consent behind it, and says so in a way the model can act on.
     """
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
-    from app.obs.trace import Trace
+    from app.agents.context import RequestContext
+    from app.agents.controls import _authorize, _refusal
+    from app.mcpserver.registry import get_tool
 
-    out = agent_for(BOT_05)._run_tool(
-        "quote_create_health",
-        {"product_id": "PHS", "sum_insured": 500000,
-         "member_ages": [40], "city": "Pune"},
-        {"persona": "customer", "lob": "health", "authenticated": True,
-         "customer_id": "C-10001", "user_id": CUSTOMER, "consent": {}},
-        Trace())
+    extras = get_tool("quote_create_health").extras or {}
+    ok, why = _authorize(
+        extras,
+        RequestContext(persona="customer", lob="health", authenticated=True,
+                       customer_id="C-10001", user_id=CUSTOMER, consent={}),
+        {})
+    assert not ok and "consent" in why
+    out = _refusal(extras, why, runtime=None)
     assert out["error"] == "consent_required"
     assert out["purpose"] == "quotation"
     assert "consent_grant" in out["try_instead"]
@@ -280,13 +279,18 @@ def test_corpus_scope_is_injected_not_offered_to_the_model(client):
 
 
 def test_the_agent_bot_actually_reaches_agent_scope_content(client):
-    """The other half: BOT-02 gets the agent corpus without asking for it."""
+    """The other half: BOT-02 gets the agent corpus without asking for it.
+    Scope comes from the request context, not a model argument."""
+    from app.agents.context import RequestContext
     from app.mcpserver.tools.knowledge import kb_search_motor
 
-    customer = kb_search_motor("commission grid own damage rates",
-                               _scopes=["public"])
-    agent = kb_search_motor("commission grid own damage rates",
-                            _scopes=["public", "agent"])
+    def rt(scopes):
+        return type("R", (), {"context": RequestContext(corpus_scope=scopes)})()
+
+    customer = kb_search_motor.func("commission grid own damage rates",
+                                    runtime=rt(["public"]))
+    agent = kb_search_motor.func("commission grid own damage rates",
+                                 runtime=rt(["public", "agent"]))
     assert not any(c["chunk_id"].startswith("M-COMM-GRID")
                    for c in customer["chunks"])
     assert any(c["chunk_id"].startswith("M-COMM-GRID")

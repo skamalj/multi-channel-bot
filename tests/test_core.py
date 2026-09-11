@@ -190,11 +190,15 @@ def test_a_motor_policy_can_actually_be_issued_once_the_surveyor_reports():
 
 
 def test_a_customer_cannot_clear_their_own_inspection():
-    from app.mcpserver.registry import authorize, get_tool
+    from app.agents.context import RequestContext
+    from app.agents.controls import _authorize
+    from app.mcpserver.registry import get_tool
 
-    spec = get_tool("inspection_result")
-    assert spec.tags["persona"] == "agent"
-    ok, why = authorize(spec, {"persona": "customer", "user_id": "u",
-                               "lob": "motor", "authenticated": True},
-                        {"application_id": "A-1", "outcome": "clean"})
+    extras = get_tool("inspection_result").extras or {}
+    assert extras["tags"]["persona"] == "agent"
+    ok, why = _authorize(
+        extras,
+        RequestContext(persona="customer", user_id="u", lob="motor",
+                       authenticated=True),
+        {"application_id": "A-1", "outcome": "clean"})
     assert not ok and "persona" in why

@@ -1,15 +1,11 @@
 """ONE MCP server hosting every tool (AG-1).
 
-One deployment, one Cloud Map entry, one CI pipeline, one middleware for
-auth, idempotency, rate limiting and audit. Six servers is six connections
-and six handshakes per Lambda cold start, paid on every conversation.
+One deployment, one Cloud Map entry, one CI pipeline. Agents do not each get a
+server; they filter THIS server's tool list by tag at build time. In-process
+they bind the registry's `@tool` objects directly, which is a local transport
+over the same manifest - `describe()` is what both paths read.
 
-Agents do not each get a server; they filter THIS server's tool list by tag
-at build time. In-process they call the registry directly, which is a local
-transport over the same manifest - `describe()` is what both paths read.
-
-Run it as a real MCP stdio server (for MCP Inspector, or for an agent
-runtime that speaks MCP over a wire):
+Run it as a real MCP stdio server:
 
     uv run python -m app.mcpserver.server --serve
 
@@ -22,39 +18,42 @@ from __future__ import annotations
 import json
 import sys
 
-# Importing the tool modules is what registers them.
-from app.mcpserver.tools import issuance, knowledge, policy, product  # noqa: F401
-from app.mcpserver.registry import get_tool, json_schema, list_tools
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+from app.mcpserver.registry import all_tools, get_tool
 
 
 def describe() -> list[dict]:
-    """The manifest. Selection tags and behaviour metadata, side by side."""
-    return [
-        {
+    """The manifest: the model-visible schema and the behaviour policy from
+    `extras`, side by side. The schema is what the model receives; the policy
+    (effect/authority/auth/consent/subject/tags) is read server-side by the
+    authorization hook and never sent to the model."""
+    out = []
+    for t in sorted(all_tools(), key=lambda s: s.name):
+        fn = convert_to_openai_tool(t)["function"]
+        extras = t.extras or {}
+        out.append({
             "name": t.name,
-            "description": t.description,
-            "signature": t.signature,
-            "input_schema": json_schema(t),
-            "tags": t.tags,
-            "effect": t.effect,
-            "authority": t.authority,
-            "pii": t.pii,
-            "auth": t.auth,
-            "subject": t.subject,
-            "consent_purpose": t.consent_purpose,
-            "confirm": t.confirm,
-            "idempotent": t.idempotent,
-        }
-        for t in sorted(list_tools(), key=lambda s: s.name)
-    ]
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {}),
+            "tags": extras.get("tags", {}),
+            "effect": extras.get("effect", "read"),
+            "authority": extras.get("authority", "none"),
+            "pii": extras.get("pii", False),
+            "auth": extras.get("auth", "anonymous"),
+            "subject": extras.get("subject", "none"),
+            "consent_purpose": extras.get("consent_purpose"),
+            "hitl_required": extras.get("hitl_required", False),
+        })
+    return out
 
 
 def serve() -> None:                                         # pragma: no cover
     """Expose the same registry over MCP stdio.
 
     Note what is NOT here: an authorization decision. Over a wire the caller
-    context arrives with the request, and `authorize()` runs against it in
-    the calling layer. A tool server that trusts its transport is a tool
+    context arrives with the request, and the authorization hook runs against
+    it in the calling layer. A tool server that trusts its transport is a tool
     server with no control.
     """
     import anyio
@@ -71,13 +70,13 @@ def serve() -> None:                                         # pragma: no cover
 
     @server.call_tool()
     async def _call(name: str, arguments: dict) -> list[TextContent]:
-        spec = get_tool(name)
-        if spec is None:
+        tool = get_tool(name)
+        if tool is None:
             return [TextContent(type="text",
                                 text=json.dumps({"error": "unknown_tool",
                                                  "name": name}))]
         try:
-            result = spec.fn(**arguments)
+            result = tool.invoke(arguments)
         except Exception as exc:                             # noqa: BLE001
             result = {"error": type(exc).__name__, "detail": str(exc)}
         return [TextContent(type="text",

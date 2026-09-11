@@ -64,21 +64,29 @@ def capability_matrix() -> dict[str, dict]:
     tool set is computed per turn cannot produce this document at all - which
     is why this is the artefact a maker-checker control can actually review.
     """
-    from app.mcpserver.registry import list_tools
+    from app.mcpserver.registry import tools_for
 
     out: dict[str, dict] = {}
     for spec in REGISTRY.values():
-        tools = sorted(list_tools(match=spec.tool_tags), key=lambda t: t.name)
+        tools = sorted(tools_for(spec.tool_tags), key=lambda t: t.name)
         out[spec.bot_id] = {
             "name": spec.name,
             "persona": spec.persona,
             "lob": spec.lob,
             "corpus_scope": spec.corpus_scope,
             "tools": [
-                {"name": t.name, "effect": t.effect, "authority": t.authority,
-                 "auth": t.auth, "pii": t.pii, "confirm": t.confirm,
-                 "subject": t.subject, "consent_purpose": t.consent_purpose}
-                for t in tools
+                {"name": t.name, **_policy(t)} for t in tools
             ],
         }
     return out
+
+
+def _policy(tool) -> dict:
+    """The behaviour metadata a maker-checker review reads, from `extras`."""
+    e = tool.extras or {}
+    return {"effect": e.get("effect", "read"),
+            "authority": e.get("authority", "none"),
+            "auth": e.get("auth", "anonymous"), "pii": e.get("pii", False),
+            "subject": e.get("subject", "none"),
+            "consent_purpose": e.get("consent_purpose"),
+            "hitl_required": e.get("hitl_required", False)}

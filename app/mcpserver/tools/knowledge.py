@@ -2,59 +2,47 @@
 
 Retrieval is metadata-pre-filtered by lob and corpus scope BEFORE ranking, so
 entitlement is structural rather than a prompt instruction (KB-2). The tool
-returns the accepted chunks to the model and puts everything it rejected,
-with scores, under `_trace` - which the agent strips before the model sees it
-and writes into the glass box instead (OB-4).
+returns the accepted chunks to the model and puts everything it rejected, with
+scores, under `_trace`.
 
-**`_scopes` is injected, never modelled.** It comes from the bound agent's
-`corpus_scope` and is not in the schema the model sees. That is not tidiness:
-a scope the model can pass is a scope the model can *choose*, and a customer
-bot whose model asks for `scopes=["agent"]` would be handed the commission
-grid by a pre-filter doing exactly what it was told. Entitlement cannot be an
-argument.
+**Corpus scope is read from `runtime.context`, never modelled.** It comes from
+the bound agent's `corpus_scope`; a scope the model could pass is a scope the
+model could choose, and a customer bot whose model asked for the "agent" scope
+would be handed the commission grid by a pre-filter doing as it was told.
+Entitlement cannot be an argument.
 
-An empty result is a correct answer. Below the score floor the tool returns
-nothing and says so, and the agent refuses and offers a human rather than
-composing something confident out of four bad chunks (KB-5).
+An empty result is a correct answer: below the score floor the tool returns
+nothing and says so, and the model is told (by the prompt) to offer a human
+rather than answer from general knowledge (KB-5).
 """
 from __future__ import annotations
+
+from typing import Annotated, Optional
+
+from langchain.tools import tool, ToolRuntime
 
 from app.knowledge.retriever import search as _local_search
 
 
-def search(query, lob, scopes, k=None, as_of=None, product=None):
+def _search(query, lob, scopes, k=None, as_of=None, product=None):
     """Bedrock Knowledge Base when one is deployed, the local index when not.
-
-    Chosen here rather than inside the retriever so the local index stays a
-    self-contained thing the offline tests exercise directly. Both return the
-    same `(accepted, rejected, stats)`, and `stats["backend"]` says which
-    answered - the glass box should never be vague about where a citation
-    came from.
-    """
+    Both return the same `(accepted, rejected, stats)`."""
     from app.knowledge import kb
 
     if kb.configured():
         return kb.search(query, lob, scopes, k=k, as_of=as_of, product=product)
     return _local_search(query, lob, scopes, k=k, as_of=as_of, product=product)
-from app.mcpserver.registry import tool
 
 
 def _run(query: str, lob: str, scopes: list[str] | None, k: int | None,
          as_of: str | None) -> dict:
-    accepted, rejected, stats = search(query, lob, scopes or ["public"],
-                                       k=k, as_of=as_of)
-    # NUMBERED, and that is the whole point.
-    #
-    # The model used to be handed `PHS-POLICY_WORDING-V2#1` and asked to echo
-    # it back. It paraphrased - `PHS-POLICYWORDING-V21`, underscore and hash
-    # gone - and a correct, well-sourced answer was refused because a string
-    # comparison failed. Language models paraphrase things that look like
-    # language, and a structured id looks like language.
-    #
-    # `[1]` does not. There is no fuzzy way to write it, so resolving a
-    # citation stops being a matching problem and becomes an array index.
-    # The real chunk_id travels alongside for the trace and the audit record,
-    # so nothing is lost downstream - the model simply is not asked for it.
+    accepted, rejected, stats = _search(query, lob, scopes or ["public"],
+                                        k=k, as_of=as_of)
+    # NUMBERED refs, and that is the whole point. Handed `PHS-WORDING-V2#1` the
+    # model paraphrases it - underscore and hash gone - and a well-sourced
+    # answer is refused on a failed string compare. `[1]` has no fuzzy form:
+    # resolving a citation becomes an array index, not a matching problem. The
+    # real chunk_id travels alongside for the trace, so nothing is lost.
     chunks = []
     for n, c in enumerate(accepted, 1):
         d = c.as_dict()
@@ -66,11 +54,11 @@ def _run(query: str, lob: str, scopes: list[str] | None, k: int | None,
         "grounded": bool(accepted),
         "scopes_searched": scopes or ["public"],
         "instruction": (
-            "Each passage above has a `ref` number. Cite it in square "
-            "brackets - [1], [2] - after every sentence you take from that "
-            "passage. Use the number only, never the chunk_id. If this list "
-            "is empty, say you do not have an approved source and offer a "
-            "colleague - do not answer from general knowledge."),
+            "Each passage has a `ref` number. Cite it in square brackets - "
+            "[1], [2] - after every sentence you take from that passage. Use "
+            "the number only, never the chunk_id. If this list is empty, say "
+            "you do not have an approved source and offer a colleague - do not "
+            "answer from general knowledge."),
         "_trace": {
             "rejected": [c.as_dict(with_text=False) for c in rejected],
             "stats": stats,
@@ -78,22 +66,56 @@ def _run(query: str, lob: str, scopes: list[str] | None, k: int | None,
     }
 
 
-@tool(tags={"lob": "health", "persona": "customer|agent"}, authority="none")
-def kb_search_health(query: str, as_of: str | None = None,
-                     _scopes: list[str] | None = None) -> dict:
-    """Search approved HEALTH product, process and regulatory content.
+def _log_and_strip(result: dict, query: str, as_of: str | None, runtime) -> dict:
+    """Pull the rejected candidates and stats out of the tool result into the
+    trace (OB-4), and hand the model only the accepted chunks. The `_trace`
+    block is internal - a customer's answer must be grounded in what was
+    accepted, and the model should never see what was thrown away."""
+    meta = result.pop("_trace", {}) or {}
+    trace = getattr(getattr(runtime, "context", None), "trace", None)
+    if trace is not None:
+        stats = meta.get("stats", {})
+        chunks = result.get("chunks", [])
+        trace.add("retrieve", (query or "")[:120],
+                  accepted=len(chunks), rejected=len(meta.get("rejected", [])),
+                  corpus=stats.get("corpus"),
+                  after_prefilter=stats.get("after_prefilter"),
+                  dropped_by_prefilter=stats.get("dropped"),
+                  floor=stats.get("floor"), as_of=as_of,
+                  accepted_chunks=[{k: c.get(k) for k in
+                                    ("chunk_id", "score", "source", "section",
+                                     "page", "authority", "version")}
+                                   for c in chunks],
+                  rejected_chunks=meta.get("rejected", []))
+    return result
 
-    Returns chunks with source, section and page for citation. Pass `as_of`
-    as the policy start date when the question is about a policy the customer
-    already holds - wordings are effective-dated and the answer must come
-    from the version in force on that date."""
-    return _run(query, "health", _scopes, None, as_of)
+
+@tool(extras={"tags": {"lob": "health", "persona": "customer|agent"},
+              "authority": "none"})
+def kb_search_health(
+    query: str,
+    as_of: Annotated[Optional[str], "Policy start date (YYYY-MM-DD) when the "
+                     "question is about a policy already held; wordings are "
+                     "effective-dated."] = None,
+    runtime: ToolRuntime = None,
+) -> dict:
+    """Search approved health product, process and regulatory content. Returns
+    passages with source, section and page for citation."""
+    scopes = getattr(runtime.context, "corpus_scope", None) if runtime else None
+    return _log_and_strip(_run(query, "health", scopes, None, as_of),
+                          query, as_of, runtime)
 
 
-@tool(tags={"lob": "motor", "persona": "customer|agent"}, authority="none")
-def kb_search_motor(query: str, as_of: str | None = None,
-                    _scopes: list[str] | None = None) -> dict:
-    """Search approved MOTOR product, process and regulatory content.
-
-    Returns chunks with source, section and page for citation."""
-    return _run(query, "motor", _scopes, None, as_of)
+@tool(extras={"tags": {"lob": "motor", "persona": "customer|agent"},
+              "authority": "none"})
+def kb_search_motor(
+    query: str,
+    as_of: Annotated[Optional[str], "Policy start date (YYYY-MM-DD) when the "
+                     "question is about a policy already held."] = None,
+    runtime: ToolRuntime = None,
+) -> dict:
+    """Search approved motor product, process and regulatory content. Returns
+    passages with source, section and page for citation."""
+    scopes = getattr(runtime.context, "corpus_scope", None) if runtime else None
+    return _log_and_strip(_run(query, "motor", scopes, None, as_of),
+                          query, as_of, runtime)

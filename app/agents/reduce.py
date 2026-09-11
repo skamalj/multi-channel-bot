@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 
 from app.config import settings
@@ -81,7 +82,7 @@ def _summariser(trace: Trace):
         try:
             with trace.timed("llm", "summarise", messages=len(pruned),
                              model=settings().bedrock_small_model_id):
-                resp = get_llm(small=True, guardrail=False).invoke([
+                resp = get_llm(small=True).invoke([
                     SystemMessage(content=SUMMARY_PROMPT),
                     HumanMessage(content=body[:8000])])
             content = resp.content
@@ -145,3 +146,19 @@ def reduce_thread(state: dict, trace: Trace) -> dict:
     injected = [m for m in surviving if id(m) not in original]
     return {"messages": [RemoveMessage(id=m.id) for m in removed if m.id]
                         + injected}
+
+
+class Reducer(AgentMiddleware):
+    """The history reducer, mounted as a `before_model` hook.
+
+    Our own state management (the one non-framework piece we keep). It runs
+    before every model call, bounds the thread with `reduce_thread` - pruning
+    old turns, keeping each AI/Tool pair intact, injecting a summary - and
+    returns the `RemoveMessage` delta for the framework to apply. It is not a
+    node and it never trims at call time; the framework owns the message list,
+    this only hands it what to drop.
+    """
+
+    def before_model(self, state, runtime):
+        trace = getattr(getattr(runtime, "context", None), "trace", None) or Trace()
+        return reduce_thread(dict(state), trace) or None

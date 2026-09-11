@@ -29,10 +29,13 @@ class Settings(BaseSettings):
     ddb_audit_table: str = "mcb-audit"
     s3_bucket: str = "mcb-artifacts-CHANGE-ME"
 
-    # LangGraph bounds the graph, not a counter of ours. Super-steps, so one
-    # model/tools round trip costs two: 40 allows a comparison that searches
-    # several products and still stops a loop that will not settle.
-    graph_recursion_limit: int = 40
+    # The loop is bounded by the framework's own limit middleware, not a
+    # counter of ours. run_limit is per invocation: enough model rounds to
+    # search several products and act, and a tool ceiling that stops a loop
+    # that will not settle. exit_behavior="end" ends the turn cleanly rather
+    # than raising, so there is nothing to catch in the orchestrator.
+    model_call_limit: int = 12
+    tool_call_limit: int = 20
 
     session_ttl_days: int = 30
     resolver_ttl_days: int = 180
@@ -57,14 +60,14 @@ class Settings(BaseSettings):
     # guardrail is attached, which is the offline and test posture - the
     # deploy asserts it is set in a real environment rather than letting a
     # missing id silently disable the control.
-    # The claim verifier (app/agents/verify.py). Off in tests and offline;
-    # on wherever there is a model to ask.
+    # The grounding verifier (app/agents/verify.py) and the model-based input
+    # guardrail (app/agents/guardrails.py). Both are provider-agnostic
+    # middleware, both cost a small-model call, and both are off offline and in
+    # tests (there is no model to ask) and on wherever there is one. There is
+    # no Bedrock-Guardrails id here any more: guardrails are middleware in the
+    # agent, not a property of the model object.
     verifier_enabled: bool = True
-
-    guardrail_id: str = ""
-    guardrail_version: str = "DRAFT"
-    # Supplied by the guardrails stack, which owns the wording.
-    guardrail_blocked_message: str = ""
+    input_guardrail_enabled: bool = True
 
     # Bedrock Knowledge Base. Empty falls back to the local corpus, which is
     # what the offline tests use.

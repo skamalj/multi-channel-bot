@@ -54,93 +54,69 @@ def test_nothing_counts_rounds_to_bound_the_loop():
     assert not hasattr(G.Agent, "_final")
 
 
-def test_a_tool_call_always_reaches_the_tools_node():
-    """The invariant that makes an orphaned tool call impossible."""
-    from langchain_core.messages import AIMessage
+def test_the_loop_is_bounded_by_the_frameworks_limit_middleware():
+    """A model that will not stop calling tools is stopped by the framework's
+    ToolCallLimit middleware, not by a counter of ours. exit_behavior="end"
+    ends the turn cleanly rather than raising, so the run terminates instead
+    of looping forever."""
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import ToolCallLimitMiddleware
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.tools import tool as make_tool
 
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
+    calls = {"n": 0}
 
-    agent = agent_for(BOT_05)
-    calling = {"messages": [AIMessage(content="", id="a1", tool_calls=[
-        {"name": "kb_search_health", "args": {"query": "x"}, "id": "tc1"}])]}
-    assert agent._after_model(calling) == "tools"
+    @make_tool
+    def ping() -> str:
+        """ping"""
+        return "pong"
 
-    answering = {"messages": [AIMessage(content="here you go", id="a2")]}
-    assert agent._after_model(answering) == "respond"
-
-
-def test_the_graph_is_bounded_by_the_frameworks_limit():
-    """A model that will not stop calling tools is stopped by LangGraph, not
-    by us. GraphRecursionError is the framework saying the loop will not
-    settle; the orchestrator turns it into an honest reply."""
-    from langgraph.errors import GraphRecursionError
-
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
-
-    class _Relentless:
+    class Relentless:
         """Always asks for another tool. Never answers."""
 
-        def bind_tools(self, _tools):
+        def bind_tools(self, tools, **_):
             return self
 
-        def invoke(self, _messages):
-            from langchain_core.messages import AIMessage
-            _Relentless.n = getattr(_Relentless, "n", 0) + 1
-            return AIMessage(content="", id=f"a{_Relentless.n}", tool_calls=[
-                {"name": "kb_search_health", "args": {"query": "again"},
-                 "id": f"tc{_Relentless.n}"}])
+        def invoke(self, messages, **_):
+            calls["n"] += 1
+            return AIMessage(content="", id=f"a{calls['n']}", tool_calls=[
+                {"name": "ping", "args": {}, "id": f"tc{calls['n']}"}])
 
-    agent = agent_for(BOT_05)
-    original, agent.llm = agent.llm, _Relentless()
-    try:
-        with pytest.raises(GraphRecursionError):
-            agent.graph.invoke(
-                {"messages": [], "user_id": "u-recursion",
-                 "bot_id": "BOT-05", "persona": "customer", "lob": "health"},
-                {"configurable": {"thread_id": "recursion-test"},
-                 "recursion_limit": 8})
-    finally:
-        agent.llm = original
+    agent = create_agent(
+        model=Relentless(), tools=[ping],
+        middleware=[ToolCallLimitMiddleware(run_limit=3, exit_behavior="end")])
+    out = agent.invoke({"messages": [HumanMessage(content="go")]})
+
+    # It terminated (did not loop forever) and stopped at the limit.
+    assert calls["n"] <= 4, f"the limit did not stop the loop: {calls['n']}"
+    assert out["messages"], "the run produced no messages"
 
 
 def test_the_idempotency_key_is_the_call_not_the_turn():
     """A quote agreed to twice is one quote.
 
-    The key used to be set on the confirmed path, and when that path was
-    deleted it fell back to the turn's message id - a different value every
-    turn, so asking again would have written again. A customer repeating
-    themselves is precisely the retry this absorbs.
+    The key is derived in the write tool from its own arguments, so it is
+    identical across turns and retries (same call, same key) and differs when
+    the arguments do (a different operation). The store replays the first
+    result on a repeat rather than writing again.
     """
-    from app.agents.graph import agent_for
-    from app.agents.registry import BOT_05
-    from app.obs.trace import Trace
+    from app.agents import confirm
+    from app.coremock import rating, store
 
-    agent = agent_for(BOT_05)
     args = {"product_id": "PHS", "sum_insured": 500000,
-            "member_ages": [40], "city": "Pune"}
-    ctx = {"persona": "customer", "lob": "health", "authenticated": True,
-           "customer_id": "C-10001", "user_id": "u-idem",
-           "consent": {"quotation": True}}
+            "member_ages": [40], "city": "Pune", "addons": None}
+    key = confirm.token_for("quote_create_health", args)
 
-    keys = []
-    for message_id in ("msg-1", "msg-2"):
-        trace = Trace()
-        agent._run_tool("quote_create_health", args,
-                        ctx | {"idempotency_key": message_id}, trace)
-        writes = [e for e in trace.events
-                  if e.kind == "gate" and e.label.startswith("write")]
-        keys.append(writes[0].detail["idempotency_key"])
+    # Same call -> same key, every turn. Different args -> different operation.
+    assert confirm.token_for("quote_create_health", args) == key
+    assert confirm.token_for(
+        "quote_create_health", {**args, "sum_insured": 1000000}) != key
 
-    assert keys[0] == keys[1], (
-        "two turns produced two keys, so the same quote would be written "
-        f"twice: {keys}")
-
-    # A different argument is a different operation.
-    trace = Trace()
-    agent._run_tool("quote_create_health", args | {"sum_insured": 1000000},
-                    ctx | {"idempotency_key": "msg-3"}, trace)
-    other = [e for e in trace.events
-             if e.kind == "gate" and e.label.startswith("write")][0]
-    assert other.detail["idempotency_key"] != keys[0]
+    # And the store replays the first result rather than writing a second.
+    store.reset_chaos()
+    first = store.save_quote(rating.rate_health("PHS", 500000, [40], "Pune", []),
+                             idempotency_key=key)
+    again = store.save_quote(rating.rate_health("PHS", 500000, [40], "Pune", []),
+                             idempotency_key=key)
+    assert again.get("idempotent_replay")
+    assert again["quote_id"] == first["quote_id"]

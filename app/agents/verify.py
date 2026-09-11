@@ -159,7 +159,7 @@ def check(answer: str, chunks: list[dict],
         # this is capacity rather than prompting - and a gate that decides
         # whether an answer reaches a customer is the wrong place to save a
         # fraction of a cent per turn.
-        resp = get_llm(guardrail=False).invoke([
+        resp = get_llm().invoke([
             SystemMessage(content=SYSTEM),
             HumanMessage(content="\n\n".join(body)[:24000])])
         content = resp.content

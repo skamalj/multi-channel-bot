@@ -47,9 +47,10 @@ def test_each_line_of_business_gets_its_own_thread(client):
     _say(client, CUSTOMER, "actually my car renewal is due")
 
     health = _bot_values(BOT_05, CUSTOMER, "health")
-    motor = _bot_values(BOT_06, CUSTOMER, "motor")
-    assert health.get("lob") == "health" and motor.get("lob") == "motor"
-
+    # The health thread holds its own turn and cannot see the motor one - the
+    # compartment guarantee. (lob lives in the per-turn context now, not in
+    # the checkpointed state, so it is not asserted on here.)
+    assert health.get("messages")
     health_text = " ".join(str(m.content) for m in health["messages"])
     assert "car renewal" not in health_text
 
@@ -86,23 +87,13 @@ def test_the_per_turn_context_is_never_checkpointed(client):
         assert leaked not in values, f"{leaked} was checkpointed"
 
 
-def test_per_turn_scratch_is_reset_on_the_way_in(client):
-    """Retrieval results and tool names are per-turn. They live in state
-    because everything in a graph does, so the entry node clears them."""
-    _say(client, CUSTOMER, "what is the waiting period for pre-existing disease")
-    after_retrieval = _bot_values(BOT_05, CUSTOMER, "health")
-    assert after_retrieval.get("retrieved")
+# test_per_turn_scratch_is_reset_on_the_way_in is gone: there is no per-turn
+# scratch in state any more (`retrieved`, `rounds`, `tool_facts`, ...). The
+# react loop keeps retrieval results in the thread's ToolMessages, and the
+# grounding guardrail reads them back from there - so there is nothing to
+# "reset on the way in". That identity/scratch is never persisted is covered
+# by test_the_per_turn_context_is_never_checkpointed below.
 
-    # A turn that retrieves nothing must not inherit the last turn's chunks.
-    _say(client, CUSTOMER, "thanks")
-    after = _bot_values(BOT_05, CUSTOMER, "health")
-    assert not after.get("retrieved")
-
-    # `rounds` counts THIS turn, not the conversation. It is a trace label
-    # now and nothing more - the loop is bounded by recursion_limit - but a
-    # counter that accumulated across turns would still be a bug worth
-    # catching, so it is checked against the first turn rather than growing.
-    assert after.get("rounds", 0) <= after_retrieval.get("rounds", 0)
 
 def test_the_checkpointer_keeps_a_history_we_can_read_back(client):
     """State history comes free with a checkpointer, and it is what makes the
