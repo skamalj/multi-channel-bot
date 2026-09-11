@@ -69,6 +69,19 @@ class Settings(BaseSettings):
     verifier_enabled: bool = True
     input_guardrail_enabled: bool = True
 
+    # Human-in-the-loop for policy issuance (agent-wait, async mode). The
+    # request rides on the tool via @hitl; the decision comes back as a new
+    # message and the approvals row (below) is the ledger. Empty table/topic =
+    # offline posture: the request is announced to an in-memory/log sink and
+    # nothing external is written, which is what the tests use.
+    approvals_table: str = ""                    # DynamoDB, the approval ledger
+    approvals_sns_topic_arn: str = ""            # where the request is announced
+    # Advisory, enforced by us. A window we would defend to the customer, an
+    # answer that goes stale over a weekend, and the group that may approve.
+    issuance_approval_timeout: str = "PT4H"
+    issuance_answer_ttl: str = "PT24H"
+    issuance_approver_group: str = "underwriting"
+
     # Bedrock Knowledge Base. Empty falls back to the local corpus, which is
     # what the offline tests use.
     knowledge_base_id: str = ""

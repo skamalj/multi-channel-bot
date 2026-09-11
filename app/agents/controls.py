@@ -73,6 +73,40 @@ class ToolControls(AgentMiddleware):
                 status="error",
             )
 
+        # Issuance is HITL-gated (@hitl async publishes an approval request when
+        # the tool runs). Only ASK a human for something that can actually
+        # execute: refuse before the tool publishes if a blocking gate is
+        # unclear, so the question a human approves is one that can issue.
+        if name == "policy_issue":
+            # The announcer overwrites its row on every publish, so this hook is
+            # the single point that decides whether an issuance may be
+            # (re)requested. If a human already decided it, never publish again.
+            decided = _already_decided(args.get("application_id"))
+            if decided:
+                if trace is not None:
+                    trace.add("gate", "issuance_already_decided", status=decided)
+                return ToolMessage(
+                    content=json.dumps({
+                        "error": "already_decided", "status": decided,
+                        "detail": (f"a colleague has already decided this "
+                                   f"issuance ({decided}); do not request it "
+                                   f"again")}),
+                    tool_call_id=request.tool_call["id"], name=name,
+                    status="error")
+
+            blocking = _issuance_gates_blocking(args.get("application_id"))
+            if blocking:
+                if trace is not None:
+                    trace.add("gate", "issuance_gates_blocking", detail=blocking)
+                return ToolMessage(
+                    content=json.dumps({
+                        "error": "gate_not_cleared", "blocked_by": blocking,
+                        "detail": ("issuance cannot be requested until every "
+                                   "blocking gate clears; do not ask for "
+                                   "approval yet - clear the gate first")}),
+                    tool_call_id=request.tool_call["id"], name=name,
+                    status="error")
+
         # The per-tool glass box lives here now - the one place every tool call
         # passes through. A write is labelled "<effect> <name>" so the trace
         # reads the way it did when a graph node ran the tool.
@@ -85,6 +119,47 @@ class ToolControls(AgentMiddleware):
                       pii=extras.get("pii", False),
                       ok=getattr(result, "status", None) != "error")
         return result
+
+
+# -- issuance gate pre-check -------------------------------------------------
+
+def _already_decided(application_id) -> str | None:
+    """Terminal status of a prior issuance request for this application on this
+    thread - executed / rejected / blocked - or None if it is fresh or open.
+    Because agent-wait's announcer overwrites its row on every publish, this is
+    what stops a re-request from re-opening a question a human already closed."""
+    if not application_id:
+        return None
+    try:
+        from langgraph.config import get_config
+        from langgraph_wait.hitl import question_id_for
+
+        from app.agents import approvals
+
+        thread_id = (get_config() or {}).get("configurable", {}).get("thread_id")
+        if not thread_id:
+            return None
+        qid = question_id_for(str(thread_id), "policy_issue",
+                              {"application_id": str(application_id)})
+        row = approvals.ledger().get(str(thread_id), qid)
+    except Exception:                                          # noqa: BLE001
+        return None
+    status = (row or {}).get("status")
+    return status if status in ("executed", "rejected", "blocked") else None
+
+
+def _issuance_gates_blocking(application_id) -> list[dict]:
+    """The blocking issuance gates still unclear for this application, if any.
+    Read-only - it must not itself issue. Unknown/not-found returns empty so
+    the tool surfaces the typed not_found rather than a misleading gate error."""
+    from app.coremock import store as core
+
+    app = core.application_get(str(application_id or ""))
+    if not isinstance(app, dict) or app.get("error"):
+        return []
+    return [{"id": g.get("id"), "name": g.get("name"), "state": g.get("state")}
+            for g in app.get("gates", [])
+            if g.get("blocking") and g.get("state") != "cleared"]
 
 
 # -- the handoff gate --------------------------------------------------------

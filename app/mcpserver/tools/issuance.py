@@ -16,8 +16,10 @@ from __future__ import annotations
 from typing import Annotated, Optional
 
 from langchain.tools import tool, ToolRuntime
+from langgraph_wait import hitl
 
 from app.agents import confirm
+from app.agents.approvals import announcers, issuance_policy
 from app.coremock import store
 from app.coremock.store import CoreError
 
@@ -148,17 +150,31 @@ def payment_collect(
         return exc.as_result()
 
 
-@tool(extras={"tags": {"lob": "health|motor", "persona": "customer|agent"},
-              "effect": "write", "authority": "core", "pii": True,
-              "auth": "authenticated", "subject": "application_id"})
-def policy_issue(application_id: str) -> dict:
-    """Issue the policy. Refused, with the blocking gate named, until every
-    blocking gate has cleared."""
+def _issue_impl(application_id: str) -> dict:
+    """The actual issuance, idempotent on its own key. Reused by the tool body
+    and by the async approval handler (app/agents/approvals.py). In async HITL
+    mode the body never runs, so on approval the handler is what calls this -
+    and because the core replays on the key, calling it twice issues once."""
     key = confirm.token_for("policy_issue", {"application_id": application_id})
     try:
         return store.policy_issue(application_id, idempotency_key=key)
     except CoreError as exc:
         return exc.as_result()
+
+
+@tool(extras={"tags": {"lob": "health|motor", "persona": "customer|agent"},
+              "effect": "write", "authority": "core", "pii": True,
+              "auth": "authenticated", "subject": "application_id",
+              # Issuance needs a human's sign-off. @hitl(async) below turns the
+              # call into an approval REQUEST; controls.py refuses to let it
+              # publish until the gate chain is clear. Surfaced in the manifest.
+              "hitl_required": True})
+@hitl(mode="async", policy=issuance_policy(), announce=announcers())
+def policy_issue(application_id: str) -> dict:
+    """Issue the policy. Requesting this sends it for approval and returns a
+    pending status; it is issued only after a human approves. Refused, with the
+    blocking gate named, until every blocking gate has cleared."""
+    return _issue_impl(application_id)
 
 
 # --- claims ---------------------------------------------------------------
