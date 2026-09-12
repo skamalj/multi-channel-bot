@@ -8,24 +8,19 @@ resolution-markers = [
 
 [[package]]
 name = "agent-wait"
-version = "0.4.1"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/cb/53/82ea4ef16405745ea72268e16945fc1b6b938710da8538c36063e3290a6c/agent_wait-0.4.1.tar.gz", hash = "sha256:e7d33a0581a37d91aefab1cd157f2efb1c71d5bf68293da2469b2ef78e542817", size = 15793, upload-time = "2026-09-11T12:37:34.254Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/cd/af924e7ebaf7382112f860392a8ee2083c6b5a3c9afbad03e431d9e33ae2/agent_wait-0.5.0.tar.gz", hash = "sha256:65a74279a5fc2c7e8c20a57166ce94990754f4320b672276a5081a43a75b567b", size = 24700, upload-time = "2026-09-12T09:43:18.191Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/6b/9f639c1f0b5871ec40ba276bba2b0f458f564403d8ca7e0b0a7cdba01ee6/agent_wait-0.4.1-py3-none-any.whl", hash = "sha256:ac518f0dddbaae6bb6c326c7f73d084c7862aa3b2581477508bedb3581b048a1", size = 20582, upload-time = "2026-09-11T12:37:32.784Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/b1/d1af8b7493a577afa092edd706fd1f9b82dd7a1f75f2c23e38b3ea0b429c/agent_wait-0.5.0-py3-none-any.whl", hash = "sha256:d376220755889520bcb8427d57f3b6e146bf574fb881b934e9bc16511485d0ab", size = 32531, upload-time = "2026-09-12T09:43:16.388Z" },
 ]
 
-[[package]]
-name = "agent-wait-aws"
-version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "agent-wait" },
+[package.optional-dependencies]
+aws = [
     { name = "boto3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/02/3f/f25e8fbb432999498ae5a6bf5edd6e1c05b7ca05415417070771ab13f96c/agent_wait_aws-0.4.1.tar.gz", hash = "sha256:3055c9fdc636f4ba2b437754e3abee6943602cdab5e2ccfe44ad7a82a3f438b8", size = 5495, upload-time = "2026-09-11T12:37:39.059Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/43/df/85bd8856f40115c2db33d3e034e3cbce49a14daf66a1ef1b3e146d200376/agent_wait_aws-0.4.1-py3-none-any.whl", hash = "sha256:2f84ed6ffd03292aeeae2df9a268ba03cb7df4f62eb7f34b82b95f5f31667902", size = 8106, upload-time = "2026-09-11T12:37:36.387Z" },
+langgraph = [
+    { name = "langgraph" },
 ]
 
 [[package]]
@@ -747,19 +742,6 @@ wheels = [
 ]
 
 [[package]]
-name = "langgraph-wait"
-version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "agent-wait" },
-    { name = "langgraph" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/37/2a/53f9be942e74b349be15bbf35fe50629acacecebf595bb8e60c5589173ac/langgraph_wait-0.4.1.tar.gz", hash = "sha256:6c43e9044eb44b36625e55b09c2d6b64c6c7b8dbdc96da985424caef9e49810f", size = 6161, upload-time = "2026-09-11T12:37:40.125Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b0/b5/c287c27fcf3567a05ffefc1ffc21a01fdbf6ed36e93fd102592408f004dd/langgraph_wait-0.4.1-py3-none-any.whl", hash = "sha256:5ceced6513ba2cd9b6c1a8fb1556271d47cbb5d241d836ba9a041023a669c915", size = 7867, upload-time = "2026-09-11T12:37:37.615Z" },
-]
-
-[[package]]
 name = "langsmith"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -827,8 +809,7 @@ name = "multi-channel-bot"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "agent-wait" },
-    { name = "agent-wait-aws" },
+    { name = "agent-wait", extra = ["aws", "langgraph"] },
     { name = "agentstate-reducer" },
     { name = "boto3" },
     { name = "fastapi" },
@@ -837,7 +818,6 @@ dependencies = [
     { name = "langchain-aws" },
     { name = "langchain-core" },
     { name = "langgraph" },
-    { name = "langgraph-wait" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -859,8 +839,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-wait", specifier = ">=0.4.1" },
-    { name = "agent-wait-aws", specifier = ">=0.4.1" },
+    { name = "agent-wait", extras = ["aws", "langgraph"], specifier = ">=0.5.0" },
     { name = "agentstate-reducer", specifier = ">=0.3.0" },
     { name = "boto3", specifier = ">=1.34" },
     { name = "fastapi", specifier = ">=0.115" },
@@ -870,7 +849,6 @@ requires-dist = [
     { name = "langchain-core", specifier = ">=0.3" },
     { name = "langgraph", specifier = ">=0.2" },
     { name = "langgraph-dynamodb-checkpoint", marker = "extra == 'ddb-checkpoint'", specifier = ">=0.1" },
-    { name = "langgraph-wait", specifier = ">=0.4.1" },
     { name = "mcp", specifier = ">=1.2" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },

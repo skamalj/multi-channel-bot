@@ -2,7 +2,7 @@
 
 The split, straight from the package's contract:
 
-* **Request side** — `@hitl(mode="async", ...)` on `policy_issue` (see
+* **Request side** — `@wait(mode="async", ...)` on `policy_issue` (see
   issuance.py) publishes the question through these announcers and returns
   `pending_approval` WITHOUT running the body. Nothing parks; the customer
   thread carries on. `agent-wait` writes the approval row once (`status=open`)
@@ -164,7 +164,7 @@ class _MemoryRowAnnounce(BaseAnnounce):
 
 
 # ---------------------------------------------------------------------------
-# Wiring. Announcers are bound at @hitl decoration time; the ledger is read on
+# Wiring. Announcers are bound at @wait decoration time; the ledger is read on
 # the decision. Offline (no table) both point at one MemoryApprovals so the
 # whole loop runs without AWS; configured, at DynamoDB + SNS.
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ def announcers() -> list[BaseAnnounce]:
     if _ANNOUNCERS is None:
         cfg = settings()
         if cfg.approvals_table:
-            from agent_wait_aws import DynamoDbAnnounce, SnsAnnounce
+            from agent_wait.aws import DynamoDbAnnounce, SnsAnnounce
 
             out: list[BaseAnnounce] = [DynamoDbAnnounce(cfg.approvals_table,
                                                         region_name=cfg.aws_region)]

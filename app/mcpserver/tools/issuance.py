@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Annotated, Optional
 
 from langchain.tools import tool, ToolRuntime
-from langgraph_wait import hitl
+from agent_wait.langgraph import wait
 
 from app.agents import confirm
 from app.agents.approvals import announcers, issuance_policy
@@ -165,11 +165,11 @@ def _issue_impl(application_id: str) -> dict:
 @tool(extras={"tags": {"lob": "health|motor", "persona": "customer|agent"},
               "effect": "write", "authority": "core", "pii": True,
               "auth": "authenticated", "subject": "application_id",
-              # Issuance needs a human's sign-off. @hitl(async) below turns the
+              # Issuance needs a human's sign-off. @wait(async) below turns the
               # call into an approval REQUEST; controls.py refuses to let it
               # publish until the gate chain is clear. Surfaced in the manifest.
               "hitl_required": True})
-@hitl(mode="async", policy=issuance_policy(), announce=announcers())
+@wait(mode="async", policy=issuance_policy(), announce=announcers())
 def policy_issue(application_id: str) -> dict:
     """Issue the policy. Requesting this sends it for approval and returns a
     pending status; it is issued only after a human approves. Refused, with the

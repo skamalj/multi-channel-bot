@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     input_guardrail_enabled: bool = True
 
     # Human-in-the-loop for policy issuance (agent-wait, async mode). The
-    # request rides on the tool via @hitl; the decision comes back as a new
+    # request rides on the tool via @wait; the decision comes back as a new
     # message and the approvals row (below) is the ledger. Empty table/topic =
     # offline posture: the request is announced to an in-memory/log sink and
     # nothing external is written, which is what the tests use.

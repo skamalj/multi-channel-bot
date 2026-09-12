@@ -1,12 +1,16 @@
 # Human-in-the-loop for policy issuance
 
-Issuing a policy needs a colleague's sign-off. It runs on **agent-wait 0.4.1**
-(`agent-wait`, `langgraph-wait`, `agent-wait-aws`) in **async mode** — the
-customer thread never parks, so a long approval wait cannot fork it.
+Issuing a policy needs a colleague's sign-off. It runs on **agent-wait 0.5.0**
+— one package with extras: `agent-wait[langgraph,aws]` (bare `agent-wait` is the
+dependency-free core). In **async mode**, the customer thread never parks, so a
+long approval wait cannot fork it. Imports: `agent_wait.langgraph.wait` (the
+decorator), `agent_wait.aws.DynamoDbAnnounce`/`SnsAnnounce`, and
+`agent_wait.question_id_for` / `Question` / `publish` / `WaitPolicy` from the
+core.
 
 ## How it works
 
-**Request** — `policy_issue` is `@tool` over `@hitl(mode="async", …)`
+**Request** — `policy_issue` is `@tool` over `@wait(mode="async", …)`
 (`app/mcpserver/tools/issuance.py`). Calling it PUBLISHES an approval question
 through the announcers and returns `{"status": "pending_approval", …}` **without
 issuing**. The prompt tells the model to relay that to the customer.
@@ -61,7 +65,7 @@ these are what production adds.
     after every ISO date, so they never match — correct;
   - treat a failed `open→executing` (someone got there first) as "a human
     decided" and move on silently.
-- **Verify the AWS adapters against a real table** — agent-wait 0.4's
+- **Verify the AWS adapters against a real table** — agent-wait 0.5
   DynamoDb/SNS/SQS adapters are unit-tested (moto) but not verified against real
   AWS; test `DynamoDbAnnounce` and `DynamoApprovals` against the actual table
   before relying on them.
@@ -78,5 +82,5 @@ these are what production adds.
 - **Re-request after rejection** is refused (`already_decided`): one approval per
   application, a human's no is final. There is no attempt nonce by design.
 
-The package is frozen at 0.4.1; anything the library should do differently goes
+The package is frozen at 0.5.0; anything the library should do differently goes
 to its owner, not into this code.

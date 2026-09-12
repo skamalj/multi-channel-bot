@@ -1,12 +1,12 @@
 """Human-in-the-loop for policy issuance (agent-wait, async mode).
 
-The request rides on the tool (@hitl publishes and returns pending); the
+The request rides on the tool (@wait publishes and returns pending); the
 decision comes back as a new message and `on_decision` issues it. These prove
 the receive side offline against the in-memory ledger: exactly-once, gate-gated,
 reject is final, and a crash mid-flight still issues once because the core
 replays on its idempotency key.
 """
-from langgraph_wait.hitl import question_id_for
+from agent_wait import question_id_for
 
 from app.agents import approvals
 from app.coremock import rating, store
@@ -26,7 +26,7 @@ def _cleared_application() -> str:
 
 
 def _seed_open(thread_id: str, aid: str) -> str:
-    """What @hitl(async) publishes: one open row for the issuance question."""
+    """What @wait(async) publishes: one open row for the issuance question."""
     approvals.reset()
     qid = question_id_for(thread_id, "policy_issue", {"application_id": aid})
     approvals._MEM.put_open({
@@ -111,7 +111,7 @@ def test_an_unknown_question_is_handled_not_executed():
 
 def test_publish_then_decide_is_a_closed_loop():
     """Our announcer wiring writes the open row that the receive side reads:
-    publish (what @hitl does internally) -> row -> on_decision -> issued."""
+    publish (what @wait does internally) -> row -> on_decision -> issued."""
     from agent_wait import Question, publish
 
     aid = _cleared_application()
@@ -130,7 +130,7 @@ def test_publish_then_decide_is_a_closed_loop():
 
 
 def test_issuance_is_not_requested_until_the_gate_chain_is_clear():
-    """controls refuses policy_issue - so @hitl never publishes an approval -
+    """controls refuses policy_issue - so @wait never publishes an approval -
     while a blocking gate is unclear; a human is only asked what can execute."""
     from app.agents.controls import _issuance_gates_blocking
 

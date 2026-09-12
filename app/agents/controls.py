@@ -73,7 +73,7 @@ class ToolControls(AgentMiddleware):
                 status="error",
             )
 
-        # Issuance is HITL-gated (@hitl async publishes an approval request when
+        # Issuance is HITL-gated (@wait async publishes an approval request when
         # the tool runs). Only ASK a human for something that can actually
         # execute: refuse before the tool publishes if a blocking gate is
         # unclear, so the question a human approves is one that can issue.
@@ -132,7 +132,7 @@ def _already_decided(application_id) -> str | None:
         return None
     try:
         from langgraph.config import get_config
-        from langgraph_wait.hitl import question_id_for
+        from agent_wait import question_id_for
 
         from app.agents import approvals
 
