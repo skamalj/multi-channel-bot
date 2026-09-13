@@ -44,7 +44,7 @@ def _load(name: str, relpath: str, env: dict):
 def webhook():
     boto3 = pytest.importorskip("boto3")
     mod = _load("wa_webhook", "whatsapp/webhook/app.py",
-                {"INBOUND_QUEUE_URL": "https://example.invalid/q",
+                {"RAW_QUEUE_URL": "https://example.invalid/raw",
                  "PARAM_PREFIX": "/mcb/whatsapp",
                  # These modules build their boto3 clients at import, which is
                  # right for a Lambda - the client is reused across warm
@@ -123,40 +123,22 @@ def test_the_handshake_refuses_the_wrong_token(webhook):
     assert resp["statusCode"] == 403
 
 
-# --- what counts as a message ---------------------------------------------
-def _payload(messages: list[dict]) -> dict:
-    return {"entry": [{"changes": [{"value": {
-        "metadata": {"phone_number_id": "PN1"},
-        "contacts": [{"wa_id": "919820000009",
-                      "profile": {"name": "Priya Sharma"}}],
-        "messages": messages}}]}]}
-
-
-def test_a_text_message_becomes_one_turn(webhook):
-    out = list(webhook._messages(_payload([
-        {"id": "wamid.1", "from": "919820000009", "type": "text",
-         "timestamp": "1", "text": {"body": "what is my cover"}}])))
-    assert len(out) == 1
-    assert out[0]["text"] == "what is my cover"
-    assert out[0]["from"] == "919820000009"
-    assert out[0]["display_name"] == "Priya Sharma"
-    assert out[0]["phone_number_id"] == "PN1"
-
-
-def test_a_delivery_receipt_is_not_a_turn(webhook):
-    """Meta sends statuses down the same webhook. They are not messages."""
-    payload = {"entry": [{"changes": [{"value": {
-        "metadata": {"phone_number_id": "PN1"},
-        "statuses": [{"id": "wamid.1", "status": "delivered"}]}}]}]}
-    assert list(webhook._messages(payload)) == []
-
-
-def test_an_image_is_not_treated_as_text(webhook):
-    """Media needs a fetch with the token; it is skipped, not half-handled."""
-    out = list(webhook._messages(_payload([
-        {"id": "wamid.2", "from": "919820000009", "type": "image",
-         "image": {"id": "media-1"}}])))
-    assert out == []
+# --- the webhook forwards, it no longer parses -----------------------------
+# Parsing (text vs receipt vs media, media->S3, normalisation) moved to the
+# processor Lambda; its behaviour is covered in test_whatsapp_processor.py.
+# The webhook's only job on a good signature is to forward the raw payload.
+def test_a_signed_post_forwards_the_raw_body_to_the_queue(webhook, monkeypatch):
+    raw, sig = _signed({"object": "whatsapp_business_account", "entry": []})
+    sent: dict = {}
+    monkeypatch.setattr(webhook.sqs, "send_message",
+                        lambda **kw: sent.update(kw) or {})
+    resp = webhook.handler(
+        {"requestContext": {"http": {"method": "POST"}},
+         "headers": {"x-hub-signature-256": sig}, "body": raw.decode()}, None)
+    assert resp["statusCode"] == 200
+    assert sent["QueueUrl"] == webhook.RAW_QUEUE_URL
+    # Forwarded verbatim - the processor re-parses these exact bytes.
+    assert json.loads(sent["MessageBody"]) == json.loads(raw)
 
 
 # --- the formatter may not invent ------------------------------------------

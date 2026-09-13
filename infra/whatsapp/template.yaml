@@ -103,10 +103,32 @@ Resources:
         maxReceiveCount: !Ref MaxReceiveCount
       Tags: [{ Key: Project, Value: !Ref Prefix }]
 
+  # The RAW queue between the webhook and the processor. Standard, not FIFO:
+  # the webhook forwards a whole payload with no single message id to key on,
+  # and Meta retries are deduped downstream where the processor enqueues each
+  # message to the FIFO inbound queue with its own message id.
+  InboundRawDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-inbound-raw-dlq"
+      MessageRetentionPeriod: 1209600
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
+  InboundRawQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Prefix}-wa-inbound-raw"
+      VisibilityTimeout: 120        # comfortably over the processor's timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboundRawDlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags: [{ Key: Project, Value: !Ref Prefix }]
+
   # -------------------------------------------------------------- webhook
   # The only publicly reachable resource in the build. AuthType NONE is not
   # a lapse - Meta cannot sign with SigV4 - which is exactly why the function
-  # verifies X-Hub-Signature-256 before it believes a single byte.
+  # verifies X-Hub-Signature-256 before it believes a single byte. It forwards
+  # the raw validated payload to the raw queue; the processor does the rest.
   WebhookFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -119,14 +141,14 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          INBOUND_QUEUE_URL: !Ref InboundQueue
+          RAW_QUEUE_URL: !Ref InboundRawQueue
           PARAM_PREFIX: !Sub "/${Prefix}/whatsapp"
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
       Policies:
         - SQSSendMessagePolicy:
-            QueueName: !GetAtt InboundQueue.QueueName
+            QueueName: !GetAtt InboundRawQueue.QueueName
         - SSMParameterReadPolicy:
             ParameterName: !Sub "${Prefix}/whatsapp/*"
       Tags:
@@ -138,6 +160,56 @@ Resources:
     UpdateReplacePolicy: Delete
     Properties:
       LogGroupName: !Sub "/aws/lambda/${Prefix}-wa-webhook"
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------ processor
+  # Behind the raw queue, off Meta's clock. Parses the payload, drops status
+  # callbacks, fetches media from the Graph API and stores it in S3 (metadata
+  # only onto the queue), and enqueues one normalised message per turn to the
+  # FIFO inbound queue. Outside the VPC: it needs the Graph API, S3 and SSM,
+  # none of them private.
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}-wa-processor"
+      CodeUri: ../../whatsapp/processor/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 60                 # two Graph hops + an S3 put per media message
+      MemorySize: 512
+      Environment:
+        Variables:
+          INBOUND_QUEUE_URL: !Ref InboundQueue
+          DOCS_BUCKET: !Sub "${Prefix}-documents-${AWS::AccountId}"
+          PARAM_PREFIX: !Sub "/${Prefix}/whatsapp"
+      Events:
+        Raw:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InboundRawQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt InboundRawQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InboundQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "${Prefix}/whatsapp/*"
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${Prefix}-documents-${AWS::AccountId}/*"
+      Tags:
+        Project: !Ref Prefix
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Prefix}-wa-processor"
       RetentionInDays: 14
 
   # ------------------------------------------------------------- consumer
@@ -275,6 +347,22 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  InboundRawDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-wa-inbound-raw-dlq"
+      AlarmDescription: A WhatsApp payload could not be parsed/normalised.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt InboundRawDlq.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
 Outputs:
   WebhookUrl:
     Description: >-
@@ -282,6 +370,8 @@ Outputs:
       with the verify token from /mcb/whatsapp/verify-token.
     Value: !GetAtt WebhookFunctionUrl.FunctionUrl
     Export: { Name: !Sub "${Prefix}-wa-webhook-url" }
+  InboundRawQueueUrl:
+    Value: !Ref InboundRawQueue
   InboundQueueUrl:
     Value: !Ref InboundQueue
   OutboundQueueUrl:
