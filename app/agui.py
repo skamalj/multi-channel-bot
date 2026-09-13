@@ -126,13 +126,15 @@ def trace_events(trace, parent_message_id: str) -> list[dict]:
 
 async def run(payload: dict):
     """One turn, as AG-UI events. Yields dicts, not SSE frames."""
-    from app.orchestrator import handle
+    from app.orchestrator import handle, handle_pre_resolved
 
     t0 = time.perf_counter()
     event = ingest_event(payload)
+    props = payload.get("forwardedProps") or {}
     thread_id = payload.get("threadId") or "anonymous"
-    log.info("turn thread=%s channel=%s chars=%d",
-             thread_id, event.channel, len(event.text or ""))
+    log.info("turn thread=%s channel=%s chars=%d resolved=%s",
+             thread_id, event.channel, len(event.text or ""),
+             bool(props.get("resolved")))
 
     # `handle` is synchronous. It runs on a worker thread so the event loop
     # stays free to flush what has already been produced - without this the
@@ -142,7 +144,20 @@ async def run(payload: dict):
 
     def work():
         try:
-            holder["result"] = handle(event)
+            # A pre-resolved turn (the resolver Lambda already routed and passed
+            # persona/lob in forwardedProps) runs ONLY the bound bot. Everything
+            # else - the console, and any client that has not routed - goes
+            # through the full resolver+main path. One runtime, both shapes.
+            if props.get("resolved"):
+                holder["result"] = handle_pre_resolved(
+                    event, persona=props.get("persona"), lob=props.get("lob"),
+                    clear_journey=bool(props.get("clear_journey")),
+                    authenticated=bool(props.get("authenticated")),
+                    consent=props.get("consent") or {},
+                    shared=props.get("shared") or {},
+                    doc_refs=props.get("doc_refs") or [])
+            else:
+                holder["result"] = handle(event)
         except Exception as exc:                             # noqa: BLE001
             holder["error"] = exc
 

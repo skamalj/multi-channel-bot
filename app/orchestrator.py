@@ -28,7 +28,7 @@ from app.agents.registry import spec_for
 from app.channels.base import IngestEvent, OutboundMessage
 from app.config import settings
 from app.coremock import store as core_store
-from app.memory.longterm import consent, interactions, suppression
+from app.memory.longterm import consent as consent_ledger, interactions, suppression
 from app.obs import audit
 from app.obs.trace import Trace
 from app.resolver.graph import hydrate, resolver_graph, thread_for
@@ -84,49 +84,100 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
 
     spec = spec_for(persona, resolved["lob"]) or spec_for(persona, "health")
     agent = agent_for(spec)
+    _bind_trace(agent, spec, event, trace)
+    req_ctx = _request_context(
+        event, spec, authenticated=session.profile.authenticated,
+        consent={**consent_ledger.current(event.user_id), **session.profile.consent},
+        trace=trace)
+
+    # A document is stored and REFERENCED (the local/console media path; the
+    # WhatsApp path stores it in the processor and passes doc_refs instead).
+    turn_text, new_docs = _with_local_media(event, spec, trace)
+
+    state = _invoke_bot(agent, event, spec, req_ctx, turn_text, new_docs,
+                        session.profile.model_dump(),
+                        clear_journey=session.persona_switched)
+
+    # Bot first, resolver second (ME-4): the resolver checkpoint advances only
+    # after the bot turn returns, so a failed turn never strands a stale prior.
+    resolver.update_state(r_config, {"session": session.model_dump()})
+    return _finish(event, spec, persona, state, trace), trace
+
+
+def handle_pre_resolved(
+    event: IngestEvent, *, persona: str, lob: str, clear_journey: bool = False,
+    authenticated: bool = False, consent: dict | None = None,
+    shared: dict | None = None, doc_refs: list[dict] | None = None,
+) -> tuple[list[OutboundMessage], Trace]:
+    """The main agent WITHOUT the resolver: the route was decided upstream (the
+    resolver Lambda -> Step Functions). Runs only the bound bot on its own
+    `user#lob` thread and never touches the resolver graph. The console/sync
+    path still uses `handle()`; this is the pre-resolved WhatsApp path.
+    """
+    cfg = settings()
+    trace = Trace()
+    trace.add("channel", event.channel, message_id=event.message_id,
+              kind=event.kind, identity=event.channel_identity,
+              prompt_version=cfg.prompt_version,
+              config_version=cfg.config_version)
+
+    spec = spec_for(persona, lob) or spec_for(persona, "health")
+    agent = agent_for(spec)
+    _bind_trace(agent, spec, event, trace)
+    # Auth/consent arrive in the payload (the resolver's snapshot); merge live
+    # consent so a grant recorded since is honoured. Identity comes from the
+    # core store, which the runtime can already read.
+    req_ctx = _request_context(
+        event, spec, authenticated=authenticated,
+        consent={**consent_ledger.current(event.user_id), **(consent or {})},
+        trace=trace)
+
+    # Media bytes were already persisted to S3 by the processor; we receive the
+    # metadata refs and give the model one line per attachment.
+    turn_text = event.text or ""
+    new_docs = list(doc_refs or [])
+    for d in new_docs:
+        line = (f"[attachment: {d.get('filename') or d.get('doc_id')} "
+                f"({d.get('mime')})]")
+        turn_text = f"{turn_text}\n{line}".strip() if turn_text else line
+
+    state = _invoke_bot(agent, event, spec, req_ctx, turn_text, new_docs,
+                        shared or {}, clear_journey=clear_journey)
+    return _finish(event, spec, persona, state, trace), trace
+
+
+# -- shared bot-invocation seam (used by handle and handle_pre_resolved) ------
+
+def _bind_trace(agent, spec, event: IngestEvent, trace: Trace) -> None:
     trace.add("bind", spec.bot_id, persona=spec.persona, lob=spec.lob,
               tags=spec.tool_tags, tools=agent.tool_names,
               corpus_scope=spec.corpus_scope,
               thread=bot_thread(event.user_id, spec.lob))
 
+
+def _request_context(event: IngestEvent, spec, *, authenticated: bool,
+                     consent: dict, trace: Trace) -> RequestContext:
+    """Identity, consent and corpus scope travel as the agent's context - read
+    by tools via `runtime.context`, never in the model's schema and never
+    checkpointed. Each write tool derives its own idempotency key, so nothing
+    turn-specific belongs here."""
     customer = core_store.customer_for(event.user_id)
     producer = core_store.producer_for(event.user_id)
-    # Identity, consent and corpus scope travel as the agent's context - read
-    # by tools via `runtime.context` and by hooks via `request.runtime.context`,
-    # never in the model's schema and never checkpointed. The idempotency key
-    # is NOT here any more: each write tool derives it from its own arguments,
-    # so the same operation agreed to twice writes once regardless of the turn.
-    req_ctx = RequestContext(
-        user_id=event.user_id,
-        persona=spec.persona,
-        lob=spec.lob,
+    ctx = RequestContext(
+        user_id=event.user_id, persona=spec.persona, lob=spec.lob,
         corpus_scope=spec.corpus_scope,
         customer_id=(customer or {}).get("customer_id"),
         producer_id=(producer or {}).get("producer_id"),
-        authenticated=session.profile.authenticated,
-        consent={**consent.current(event.user_id), **session.profile.consent},
-        trace=trace,
-    )
-    trace.add("bind", "request_context",
-              authenticated=req_ctx.authenticated,
-              consent=sorted(k for k, v in req_ctx.consent.items() if v),
-              customer_id=req_ctx.customer_id, producer_id=req_ctx.producer_id)
+        authenticated=authenticated, consent=consent, trace=trace)
+    trace.add("bind", "request_context", authenticated=ctx.authenticated,
+              consent=sorted(k for k, v in ctx.consent.items() if v),
+              customer_id=ctx.customer_id, producer_id=ctx.producer_id)
+    return ctx
 
-    # The loop is bounded by the framework's limit middleware (see graph.py);
-    # exit_behavior="end" ends the turn cleanly, so there is nothing to catch.
-    b_config = {"configurable": {"thread_id": bot_thread(event.user_id, spec.lob)}}
 
-    # RS-9: a persona switch carries no journey state. The thread is the
-    # person and the line of business, so the switch clears it rather than
-    # opening a third compartment per customer.
-    if session.persona_switched:
-        trace.add("gate", "journey_state_dropped", reason="persona switch")
-        _clear_bot_thread(agent, b_config)
-        session.persona_switched = False
-
-    # A document is stored and REFERENCED. Its bytes never enter the thread:
-    # the customer sees one line, the checkpoint holds metadata, and a tool
-    # that needs the content fetches it by reference.
+def _with_local_media(event: IngestEvent, spec, trace: Trace) -> tuple[str, list[dict]]:
+    """The console/local path: bytes arrive on the event, are stored, and one
+    line is added so the model knows an attachment came in."""
     turn_text = event.text or ""
     new_docs: list[dict] = []
     if event.media is not None:
@@ -135,22 +186,29 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
             new_docs.append(ref.as_dict())
             line = ref.as_message()
             turn_text = f"{turn_text}\n{line}".strip() if turn_text else line
+    return turn_text, new_docs
 
-    # Only state-schema fields go in. Identity/persona/lob/scope are in the
-    # context now, not the state; `shared` is the one thing that crosses a
-    # compartment boundary and `documents` is metadata the thread persists.
+
+def _invoke_bot(agent, event: IngestEvent, spec, req_ctx: RequestContext,
+                turn_text: str, new_docs: list[dict], shared: dict, *,
+                clear_journey: bool):
+    # The loop is bounded by the framework's limit middleware (see graph.py);
+    # exit_behavior="end" ends the turn cleanly, so there is nothing to catch.
+    b_config = {"configurable": {"thread_id": bot_thread(event.user_id, spec.lob)}}
+    # RS-9: a persona switch carries no journey state; clear it rather than open
+    # a third compartment.
+    if clear_journey:
+        req_ctx.trace.add("gate", "journey_state_dropped", reason="persona switch")
+        _clear_bot_thread(agent, b_config)
     inputs = {
         "messages": [HumanMessage(content=turn_text)],
-        "documents": list(state_documents(agent, event, spec)) + new_docs,
-        "shared": session.profile.model_dump(),
+        "documents": list(state_documents(agent, event, spec)) + list(new_docs),
+        "shared": shared,
     }
-    state = agent.graph.invoke(inputs, b_config, context=req_ctx)  # bot first
+    return agent.graph.invoke(inputs, b_config, context=req_ctx)  # bot first
 
-    # The resolver checkpoint is written by its own invocation above; the
-    # ledger update below is the second write, and the stale-by-one-turn
-    # case self-corrects.
-    resolver.update_state(r_config, {"session": session.model_dump()})
 
+def _finish(event: IngestEvent, spec, persona, state, trace: Trace) -> list[OutboundMessage]:
     last = state["messages"][-1]
     text = last.content if isinstance(last, AIMessage) else str(last.content)
     tools = list(state.get("last_tools") or [])
@@ -158,7 +216,7 @@ def handle(event: IngestEvent) -> tuple[list[OutboundMessage], Trace]:
                              handed_off="human_handoff" in tools)
     _audit(event, spec.bot_id, spec.lob, persona, trace, text,
            list(state.get("last_citations") or []))
-    return _reply(event, text or "(no reply)", trace), trace
+    return _reply(event, text or "(no reply)", trace)
 
 
 def state_documents(agent, event: IngestEvent, spec) -> list[dict]:
